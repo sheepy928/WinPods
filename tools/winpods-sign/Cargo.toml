@@ -1,0 +1,13 @@
+[package]
+name = "winpods-sign"
+description = "Release signing helper: minisign key generation, signing and verification"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+minisign = "0.7"
+minisign-verify.workspace = true
+anyhow.workspace = true
