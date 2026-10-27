@@ -16,6 +16,12 @@
 //! receiving the response with its CSeq. Responses carrying another CSeq (late
 //! replies to a request that already timed out) are skipped.
 //!
+//! Pipelining: pyatv writes every request as soon as it is made and matches the
+//! responses by CSeq, so a slow POST /feedback never holds up TEARDOWN or a volume
+//! change. [`RtspClient::exchange`] is the simple one-at-a-time form; the session
+//! task pipelines with [`RtspClient::send_request`] (write only) and the cancel-safe
+//! [`RtspClient::next_response`], and applies [`check_status`] itself.
+//!
 //! Status handling follows `HttpConnection.send_and_receive`: 403 is an
 //! authentication error, 401 is one unless errors are allowed, 2xx succeeds, and
 //! anything else is a rejection unless errors are allowed.
@@ -25,6 +31,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::Instant;
 use tracing::{debug, trace};
 
 use crate::hap::{CipherKeys, HapError, HapReader, HapWriter, hap_pair};
@@ -406,6 +413,15 @@ impl RtspRequest {
         self.allow_error = true;
         self
     }
+
+    /// `"<METHOD> <uri> (CSeq <n>)"`, as used in timeout errors.
+    pub fn describe(&self, cseq: u32) -> String {
+        format!(
+            "{} {} (CSeq {cseq})",
+            self.method,
+            self.uri.as_deref().unwrap_or("<session>")
+        )
+    }
 }
 
 /// Encode a plist value the way pyatv sends dict bodies (binary format).
@@ -465,8 +481,8 @@ pub fn format_http_post(path: &str, headers: &[(&str, &str)], body: &[u8]) -> Ve
     )
 }
 
-/// Apply pyatv's status rules to a response.
-fn check_status(
+/// Apply pyatv's status rules to a response (`HttpConnection.send_and_receive`).
+pub fn check_status(
     method: &str,
     response: Response,
     allow_error: bool,
@@ -491,7 +507,9 @@ fn check_status(
 }
 
 /// RTSP client over one connection: assigns CSeqs, optionally HAP-encrypts, and
-/// matches responses to requests. One request is in flight at a time.
+/// matches responses to requests. [`RtspClient::exchange`] keeps one request in
+/// flight; [`RtspClient::send_request`] + [`RtspClient::next_response`] let the
+/// caller pipeline several and match the responses by CSeq.
 pub struct RtspClient<S = TcpStream> {
     stream: S,
     ctx: RtspContext,
@@ -549,34 +567,80 @@ impl<S: AsyncRead + AsyncWrite + Unpin> RtspClient<S> {
     }
 
     /// Send an RTSP request and wait for the response with the same CSeq.
+    /// [`REQUEST_TIMEOUT`] covers both; responses for other CSeqs are skipped.
     pub async fn exchange(&mut self, request: &RtspRequest) -> Result<Response, RtspError> {
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let cseq = self.write_request(request, deadline).await?;
+        let response = tokio::time::timeout_at(deadline, self.response_to(cseq))
+            .await
+            .map_err(|_| RtspError::Timeout(request.describe(cseq)))??;
+        trace!(code = response.code, cseq, "RTSP response");
+        check_status(&request.method, response, request.allow_error)
+    }
+
+    /// Write an RTSP request without waiting for its response and return the CSeq
+    /// it carries (pipelining; pair it with [`RtspClient::next_response`]). The
+    /// write is bounded by [`REQUEST_TIMEOUT`]; a write that fails or does not
+    /// finish leaves the connection closed, because part of a (HAP) frame may be on
+    /// the wire. Not cancel-safe for the same reason: let it complete.
+    pub async fn send_request(&mut self, request: &RtspRequest) -> Result<u32, RtspError> {
+        self.write_request(request, Instant::now() + REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// Read the next complete response, whatever its CSeq; no status check (see
+    /// [`check_status`]). Cancel-safe: a response is only taken from the buffer once
+    /// it is complete, and received bytes are kept across cancelled calls, so it
+    /// can sit in a `select!` next to other work. A malformed response closes the
+    /// connection (the byte stream can no longer be trusted).
+    pub async fn next_response(&mut self) -> Result<Response, RtspError> {
+        loop {
+            match parse_response(&self.inbound) {
+                Ok(Some((response, used))) => {
+                    self.inbound.drain(..used);
+                    return Ok(response);
+                }
+                Ok(None) => self.read_some().await?,
+                Err(err) => {
+                    self.closed = true;
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    /// Assign the next CSeq, format and write `request`, giving up at `deadline`.
+    async fn write_request(
+        &mut self,
+        request: &RtspRequest,
+        deadline: Instant,
+    ) -> Result<u32, RtspError> {
         let cseq = self.cseq;
         self.cseq = self.cseq.wrapping_add(1);
         let bytes = format_rtsp_request(&self.ctx, cseq, request)?;
-        let label = format!(
-            "{} {} (CSeq {cseq})",
-            request.method,
-            request.uri.as_deref().unwrap_or("<session>")
-        );
         debug!(method = %request.method, cseq, "RTSP request");
-        let response = tokio::time::timeout(REQUEST_TIMEOUT, async {
-            self.send(&bytes).await?;
-            loop {
-                let response = self.read_response().await?;
-                if response.cseq() == Some(cseq) {
-                    return Ok::<Response, RtspError>(response);
-                }
-                debug!(
-                    expected = cseq,
-                    got = ?response.cseq(),
-                    "skipping response for another request"
-                );
+        match tokio::time::timeout_at(deadline, self.send(&bytes)).await {
+            Ok(result) => result.map(|()| cseq),
+            Err(_) => {
+                self.closed = true;
+                Err(RtspError::Timeout(request.describe(cseq)))
             }
-        })
-        .await
-        .map_err(|_| RtspError::Timeout(label))??;
-        trace!(code = response.code, cseq, "RTSP response");
-        check_status(&request.method, response, request.allow_error)
+        }
+    }
+
+    /// Read responses until the one for `cseq`, skipping the rest.
+    async fn response_to(&mut self, cseq: u32) -> Result<Response, RtspError> {
+        loop {
+            let response = self.next_response().await?;
+            if response.cseq() == Some(cseq) {
+                return Ok(response);
+            }
+            debug!(
+                expected = cseq,
+                got = ?response.cseq(),
+                "skipping response for another request"
+            );
+        }
     }
 
     /// Send an HTTP/1.1 POST (pairing) and wait for the next response. Does not use
@@ -591,7 +655,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> RtspClient<S> {
         debug!(path, len = body.len(), "HTTP POST");
         let response = tokio::time::timeout(REQUEST_TIMEOUT, async {
             self.send(&bytes).await?;
-            self.read_response().await
+            self.next_response().await
         })
         .await
         .map_err(|_| RtspError::Timeout(format!("POST {path}")))??;
@@ -651,23 +715,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> RtspClient<S> {
             return Err(err.into());
         }
         Ok(())
-    }
-
-    async fn read_response(&mut self) -> Result<Response, RtspError> {
-        loop {
-            match parse_response(&self.inbound) {
-                Ok(Some((response, used))) => {
-                    self.inbound.drain(..used);
-                    return Ok(response);
-                }
-                Ok(None) => self.read_some().await?,
-                Err(err) => {
-                    // The byte stream is out of sync; nothing after this can be trusted.
-                    self.closed = true;
-                    return Err(err);
-                }
-            }
-        }
     }
 }
 
@@ -995,6 +1042,58 @@ mod tests {
             Err(RtspError::Closed)
         ));
         assert_eq!(client.next_cseq(), 3);
+    }
+
+    #[tokio::test]
+    async fn pipelined_requests_survive_cancelled_reads() {
+        let (client_end, mut server_end) = tokio::io::duplex(4096);
+        let mut client = RtspClient::new(client_end, test_context());
+        let feedback = RtspRequest::new("POST").uri("/feedback");
+        assert_eq!(feedback.describe(0), "POST /feedback (CSeq 0)");
+        assert_eq!(client.send_request(&feedback).await.unwrap(), 0);
+        let teardown = RtspRequest::new("TEARDOWN");
+        assert_eq!(teardown.describe(1), "TEARDOWN <session> (CSeq 1)");
+        assert_eq!(client.send_request(&teardown).await.unwrap(), 1);
+
+        // Both requests are on the wire before any response exists.
+        let mut buf = vec![0u8; 4096];
+        let mut received = Vec::new();
+        let mut methods = Vec::new();
+        while methods.len() < 2 {
+            let n = server_end.read(&mut buf).await.unwrap();
+            received.extend_from_slice(&buf[..n]);
+            while let Some((request, used)) = parse_request(&received).unwrap() {
+                received.drain(..used);
+                methods.push(request.method);
+            }
+        }
+        assert_eq!(methods, ["POST", "TEARDOWN"]);
+
+        // A read cancelled half-way through a response loses nothing.
+        server_end
+            .write_all(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-")
+            .await
+            .unwrap();
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(50), client.next_response()).await;
+        assert!(cancelled.is_err());
+        server_end
+            .write_all(b"Length: 2\r\n\r\nokRTSP/1.0 500 Internal Server Error\r\nCSeq: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let response = client.next_response().await.unwrap();
+        assert_eq!(
+            (response.cseq(), response.body.as_slice()),
+            (Some(1), &b"ok"[..])
+        );
+        let response = client.next_response().await.unwrap();
+        assert_eq!(response.cseq(), Some(0));
+        assert!(matches!(
+            check_status("POST", response, false),
+            Err(RtspError::Status { code: 500, .. })
+        ));
+        assert!(!client.is_closed());
+        assert_eq!(client.next_cseq(), 2);
     }
 
     #[tokio::test]

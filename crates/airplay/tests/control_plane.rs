@@ -5,7 +5,8 @@
 //! `B = k·v + g^b`), verification of the client's M1 and an M4 with the server proof
 //! (or an Error TLV to exercise retries), HAP-encrypted RTSP with swapped control
 //! keys, an event listener that sends a ~2 KB `POST /command` and checks the reply,
-//! and canned SETUP/RECORD/FLUSH/SET_PARAMETER/feedback/TEARDOWN answers. It records
+//! and canned SETUP/RECORD/FLUSH/SET_PARAMETER/feedback/TEARDOWN answers (feedback
+//! and TEARDOWN can be left unanswered to check the session's time limits). It records
 //! every decrypted request; the tests compare the order with the plan appendix and
 //! the bytes with `fixtures/rtsp_requests.json` after normalising random fields.
 //!
@@ -15,7 +16,7 @@
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use num_bigint::BigUint;
 use parking_lot::Mutex;
@@ -27,7 +28,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use winpods_airplay::hap::{HapSession, SharedSecret};
 use winpods_airplay::rtsp::{IncomingRequest, parse_request};
-use winpods_airplay::session::{Session, SessionConfig, SessionError, TimingSetup};
+use winpods_airplay::session::{
+    Session, SessionConfig, SessionError, TEARDOWN_TIMEOUT, TimingSetup,
+};
 use winpods_airplay::tlv8::{self, tag};
 use winpods_airplay::{Codec, ReceiverInfo, TimingProtocol, srp};
 
@@ -157,6 +160,11 @@ struct MockOptions {
     stream_setup_status: u16,
     /// Close the connection after answering the request with this name.
     close_after: Option<&'static str>,
+    /// Answer only the first N POST /feedback requests; later ones get no reply
+    /// (a receiver that stopped responding). `None` = answer all.
+    answered_feedback: Option<usize>,
+    /// Never answer TEARDOWN.
+    silent_teardown: bool,
 }
 
 #[derive(Default)]
@@ -369,6 +377,17 @@ impl MockReceiver {
             .unwrap_or_else(|| panic!("no {name} request"))
     }
 
+    /// Wait until `count` requests named `name` have arrived.
+    async fn wait_for(&self, name: &str, count: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.names().iter().filter(|n| *n == name).count() < count {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{count} {name} requests in time"));
+    }
+
     /// Wait for the event channel exchange and return the decrypted reply.
     async fn event_reply(&mut self) -> Vec<u8> {
         let rx = self.event_reply.take().expect("event reply taken once");
@@ -408,6 +427,7 @@ async fn serve(
     let mut event_task = None;
     let mut reply_tx = Some(reply_tx);
     let mut closed_tx = Some(closed_tx);
+    let mut feedback_seen = 0usize;
 
     while let Some((request, bytes)) = conn.next_request().await {
         let name = request_name(&request);
@@ -539,7 +559,10 @@ async fn serve(
                 .await
             }
             "feedback" => {
-                if options.feedback_status != 0 && options.feedback_status != 200 {
+                feedback_seen += 1;
+                if options.answered_feedback.is_some_and(|n| feedback_seen > n) {
+                    // No reply; keep serving the requests that follow.
+                } else if options.feedback_status != 0 && options.feedback_status != 200 {
                     conn.send(&response(
                         options.feedback_status,
                         cseq,
@@ -559,6 +582,7 @@ async fn serve(
                     conn.send(&plist_response(cseq, &body)).await;
                 }
             }
+            "teardown" if options.silent_teardown => {}
             "set_metadata" | "flush" | "set_parameter_volume" | "teardown" => {
                 conn.send(&response(200, cseq, &[], None, &[], false)).await
             }
@@ -988,6 +1012,123 @@ async fn failing_feedback_ends_the_session() {
     assert_eq!(mock.names().iter().filter(|n| *n == "feedback").count(), 3);
     assert!(session.last_feedback().is_none());
     session.teardown().await;
+    mock.finish().await;
+}
+
+/// Bound for a request the mock answers at once, even with a feedback outstanding
+/// (an unanswered feedback would otherwise hold it for up to 10 s).
+const PROMPT: Duration = Duration::from_secs(1);
+
+#[tokio::test]
+async fn unanswered_feedback_does_not_hold_up_volume_or_teardown() {
+    let mock = MockReceiver::start(MockOptions {
+        answered_feedback: Some(1),
+        ..Default::default()
+    })
+    .await;
+    let mut session = Session::connect(&mock.info(), config(Some(40.0)))
+        .await
+        .expect("connect");
+    let params = session
+        .setup(TimingSetup::Ntp { timing_port: 1 }, 2)
+        .await
+        .expect("setup");
+    session.start_playback(&params).await.expect("start");
+    assert!(session.last_feedback().is_some(), "first feedback answered");
+    // The periodic feedback 2 s later is never answered.
+    mock.wait_for("feedback", 2).await;
+
+    let started = Instant::now();
+    session.set_volume(50.0).await.expect("volume");
+    let volume_time = started.elapsed();
+    assert!(volume_time < PROMPT, "set_volume took {volume_time:?}");
+    assert!(session.end_reason().is_none());
+
+    let started = Instant::now();
+    session.teardown().await;
+    let teardown_time = started.elapsed();
+    assert!(teardown_time < PROMPT, "teardown took {teardown_time:?}");
+    let names = mock.names();
+    assert_eq!(
+        names[names.len() - 3..],
+        ["feedback", "set_parameter_volume", "teardown"]
+    );
+    mock.finish().await;
+}
+
+#[tokio::test]
+async fn unanswered_first_feedback_does_not_delay_flush() {
+    let mock = MockReceiver::start(MockOptions {
+        answered_feedback: Some(0),
+        ..Default::default()
+    })
+    .await;
+    let mut session = Session::connect(&mock.info(), config(Some(40.0)))
+        .await
+        .expect("connect");
+    let params = session
+        .setup(TimingSetup::Ntp { timing_port: 1 }, 2)
+        .await
+        .expect("setup");
+    let started = Instant::now();
+    session.start_playback(&params).await.expect("start");
+    let start_time = started.elapsed();
+    assert!(start_time < PROMPT, "start_playback took {start_time:?}");
+    assert!(session.last_feedback().is_none());
+    assert_eq!(
+        mock.names()[4..],
+        [
+            "setup_base",
+            "setup_stream",
+            "set_metadata",
+            "record",
+            "feedback",
+            "flush",
+            "set_parameter_volume"
+        ]
+    );
+    let started = Instant::now();
+    session.teardown().await;
+    let teardown_time = started.elapsed();
+    assert!(teardown_time < PROMPT, "teardown took {teardown_time:?}");
+    mock.finish().await;
+}
+
+#[tokio::test]
+async fn teardown_is_bounded_when_the_receiver_stops_answering() {
+    let mut mock = MockReceiver::start(MockOptions {
+        answered_feedback: Some(0),
+        silent_teardown: true,
+        ..Default::default()
+    })
+    .await;
+    let mut session = Session::connect(&mock.info(), config(None))
+        .await
+        .expect("connect");
+    let params = session
+        .setup(TimingSetup::Ntp { timing_port: 1 }, 2)
+        .await
+        .expect("setup");
+    session.start_playback(&params).await.expect("start");
+
+    let started = Instant::now();
+    session.teardown().await;
+    let elapsed = started.elapsed();
+    // It waited for the TEARDOWN response, but no longer than the limit.
+    assert!(
+        elapsed >= TEARDOWN_TIMEOUT - Duration::from_millis(50),
+        "{elapsed:?}"
+    );
+    assert!(
+        elapsed < TEARDOWN_TIMEOUT + Duration::from_millis(500),
+        "{elapsed:?}"
+    );
+    assert_eq!(mock.names().last().map(String::as_str), Some("teardown"));
+    let closed = mock.event_closed.take().expect("closed signal");
+    tokio::time::timeout(Duration::from_secs(5), closed)
+        .await
+        .expect("event channel closed by teardown")
+        .expect("event task alive");
     mock.finish().await;
 }
 

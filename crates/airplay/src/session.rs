@@ -17,25 +17,32 @@
 //!    response had `skipRecord`, FLUSH with `RTP-Info` (errors ignored), initial
 //!    volume. The engine then calls `runtime::start`.
 //! 4. [`Session::set_volume`] while streaming; [`Session::teardown`] at the end
-//!    (TEARDOWN `Session: 0`, 3 s timeout).
+//!    (TEARDOWN `Session: 0`; the whole call finishes within 3 s).
 //!
-//! Internally one task owns the RTSP connection; volume, feedback and teardown are
-//! serialised through it. Read EOF or 3 consecutive feedback failures set
+//! Internally one task owns the RTSP connection; volume, feedback and teardown go
+//! through it. Read EOF or 3 consecutive feedback failures set
 //! [`Session::end_reason`].
 //!
 //! Implementation notes:
 //!
 //! * The actor task is spawned at the end of `connect` (after pairing) and owns the
-//!   [`RtspClient`]. Every later request is a command answered over a oneshot, so
-//!   requests never overlap. While idle the task keeps reading the socket, which is
-//!   how a closed connection is noticed between requests.
+//!   [`RtspClient`]. Every later request is a command answered over a oneshot. The
+//!   task writes each request as soon as it gets it and matches responses by CSeq,
+//!   like pyatv (which writes at once and waits per CSeq), so an unanswered POST
+//!   /feedback never holds up FLUSH, a volume change or TEARDOWN. Each request has
+//!   its own deadline ([`REQUEST_TIMEOUT`], [`TEARDOWN_TIMEOUT`] for TEARDOWN). The
+//!   task always reads the socket, which is also how a closed connection is noticed
+//!   between requests.
 //! * Request order matches pyatv's: pyatv's feedback task first runs while the
 //!   request after `start_feedback()` (RECORD, or FLUSH with `skipRecord`) awaits its
 //!   reply, so its POST /feedback takes the next CSeq. Here the first feedback is
-//!   sent right after that request completes, which yields the same CSeq sequence
-//!   (metadata, RECORD, feedback, FLUSH, volume — `rtsp_requests.json`).
-//! * Feedback failures are counted per run of consecutive failures; the third one
-//!   sets the end reason (pyatv only logged them).
+//!   written right after that request completes and the next request follows without
+//!   waiting for the feedback's reply, which yields the same CSeq sequence (metadata,
+//!   RECORD, feedback, FLUSH, volume — `rtsp_requests.json`).
+//! * Like pyatv's loop, the next feedback is due 2 s after the previous one was
+//!   answered or failed, so at most one is outstanding. Failures are counted per run
+//!   of consecutive failures; the third one sets the end reason (pyatv only logged
+//!   them).
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
@@ -46,13 +53,15 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::bodies::{self, BaseSetup, BaseTiming, BodyError, ClockPorts};
 use crate::event_channel::EventChannel;
 use crate::hap::{self, PairingError, SharedSecret};
 use crate::ptp::PtpService;
-use crate::rtsp::{Response, RtspClient, RtspContext, RtspError, RtspRequest};
+use crate::rtsp::{
+    self, REQUEST_TIMEOUT, Response, RtspClient, RtspContext, RtspError, RtspRequest,
+};
 use crate::types::{
     Codec, DEFAULT_RENDER_MS, ReceiverInfo, StreamParams, TimingProtocol, latency_frames,
 };
@@ -67,7 +76,7 @@ pub const FEEDBACK_INTERVAL: Duration = Duration::from_secs(2);
 pub const FEEDBACK_FAILURE_LIMIT: u32 = 3;
 /// How long `setup` waits for the PTP follower to lock.
 pub const PTP_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
-/// Time allowed for the TEARDOWN exchange.
+/// Upper bound for [`Session::teardown`], TEARDOWN exchange included.
 pub const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 /// Network allowance on top of the receiver's render time (latency warning).
 const SAFETY_MS: u32 = 5;
@@ -188,10 +197,15 @@ enum Command {
         request: RtspRequest,
         reply: oneshot::Sender<Result<Response, RtspError>>,
     },
-    /// Send the first POST /feedback now and keep sending one every 2 s.
+    /// Write the first POST /feedback now (answered once it is written) and keep
+    /// sending one every 2 s.
     StartFeedback { reply: oneshot::Sender<()> },
-    /// Send TEARDOWN (3 s timeout) and stop the feedback loop.
-    Teardown { reply: oneshot::Sender<()> },
+    /// Stop the feedback loop and send TEARDOWN; answered when its response
+    /// arrives, it fails, or `deadline` passes.
+    Teardown {
+        deadline: Instant,
+        reply: oneshot::Sender<()>,
+    },
     /// Close the connection and stop the task.
     Close,
 }
@@ -505,27 +519,45 @@ impl Session {
         self.shared.last_feedback.lock().clone()
     }
 
+    /// Send TEARDOWN, then close the event channel and the connection. The whole
+    /// call is bounded by [`TEARDOWN_TIMEOUT`]: if the receiver has not answered by
+    /// then (or the session task is stuck), the connection is simply dropped.
     pub async fn teardown(mut self) {
+        let deadline = Instant::now() + TEARDOWN_TIMEOUT;
         let (reply, done) = oneshot::channel();
-        if self
-            .commands
-            .send(Command::Teardown { reply })
-            .await
-            .is_ok()
-        {
-            // An Err only means the task already stopped.
-            let _ = done.await;
+        let commands = &self.commands;
+        let answered = tokio::time::timeout_at(deadline, async move {
+            if commands
+                .send(Command::Teardown { deadline, reply })
+                .await
+                .is_ok()
+            {
+                // An Err only means the task already stopped.
+                let _ = done.await;
+            }
+        })
+        .await
+        .is_ok();
+        if !answered {
+            debug!("TEARDOWN not finished in {TEARDOWN_TIMEOUT:?}; dropping the connection");
+            if let Some(actor) = &self.actor {
+                actor.abort();
+            }
         }
         if let Some(channel) = self.event_channel.take() {
             channel.close().await;
         }
-        if self.commands.send(Command::Close).await.is_err() {
-            debug!("session task already stopped");
-        }
-        if let Some(actor) = self.actor.take()
-            && let Err(err) = actor.await
-        {
-            warn!("session task failed: {err}");
+        if let Some(actor) = self.actor.take() {
+            // The task is idle after TEARDOWN, so Close is handled at once; a full
+            // queue would mean it is stuck, and then it is stopped instead.
+            match self.commands.try_send(Command::Close) {
+                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => actor.abort(),
+            }
+            match actor.await {
+                Err(err) if !err.is_cancelled() => warn!("session task failed: {err}"),
+                _ => {}
+            }
         }
         info!("session closed");
     }
@@ -540,7 +572,8 @@ impl Session {
         Ok(response.await.map_err(|_| closed_error())??)
     }
 
-    /// Send the first feedback and start the 2 s loop.
+    /// Write the first feedback (its response is not awaited) and start the 2 s
+    /// loop.
     async fn start_feedback(&self) -> Result<(), SessionError> {
         let (reply, done) = oneshot::channel();
         self.commands
@@ -563,10 +596,33 @@ impl Drop for Session {
 /// Feedback loop bookkeeping inside the actor.
 #[derive(Default)]
 struct Feedback {
-    /// When the next POST /feedback is due (`None` = loop not running).
+    /// When the next POST /feedback is due (`None` = none scheduled: the loop is
+    /// not running, or one is waiting for its response).
     next: Option<Instant>,
     /// Consecutive failures so far.
     failures: u32,
+}
+
+/// Who is waiting for the response to a request on the wire.
+enum Waiter {
+    /// A [`Command::Request`] caller.
+    Request(oneshot::Sender<Result<Response, RtspError>>),
+    /// The feedback loop.
+    Feedback,
+    /// [`Session::teardown`].
+    Teardown(oneshot::Sender<()>),
+}
+
+/// A request that was written and has not been answered yet.
+struct Pending {
+    cseq: u32,
+    method: String,
+    allow_error: bool,
+    /// `"<METHOD> <uri> (CSeq <n>)"` for the timeout error.
+    label: String,
+    /// When the request fails with a timeout.
+    deadline: Instant,
+    waiter: Waiter,
 }
 
 /// Sleep until `deadline`, or forever when there is none.
@@ -591,98 +647,221 @@ where
     }
 }
 
-async fn send_feedback(client: &mut RtspClient, feedback: &mut Feedback, shared: &Shared) {
-    match client
-        .exchange(&RtspRequest::new("POST").uri("/feedback"))
-        .await
-    {
-        Ok(response) => {
-            feedback.failures = 0;
-            if !response.body.is_empty() {
-                match response.body_plist() {
-                    Ok(plist) => {
-                        *shared.last_feedback.lock() = Some(bodies::describe_plist(&plist))
-                    }
-                    Err(err) => debug!("feedback body is not a plist: {err}"),
-                }
-            }
-        }
-        Err(err) => {
-            feedback.failures += 1;
-            debug!(failures = feedback.failures, "feedback failed: {err}");
-            note_connection(client, &err, shared);
-            if feedback.failures >= FEEDBACK_FAILURE_LIMIT {
-                shared.set_end_reason(format!(
-                    "receiver stopped answering feedback ({} failures, last: {err})",
-                    feedback.failures
-                ));
-            }
-        }
+/// The error handed to every request still waiting when the connection failed
+/// (`RtspError` is not `Clone`).
+fn connection_error(err: &RtspError) -> RtspError {
+    match err {
+        RtspError::Closed => RtspError::Closed,
+        RtspError::Io(io) => RtspError::Io(std::io::Error::new(io.kind(), io.to_string())),
+        other => RtspError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            other.to_string(),
+        )),
     }
-    feedback.next = (!client.is_closed()).then(|| Instant::now() + FEEDBACK_INTERVAL);
 }
 
-/// The actor: owns the connection and serialises every request.
-async fn run_actor(
-    mut client: RtspClient,
-    mut inbox: mpsc::Receiver<Command>,
+/// Spawned by [`Session::connect`]: owns the connection until `Close`, the end of
+/// the command channel, or an abort.
+async fn run_actor(client: RtspClient, inbox: mpsc::Receiver<Command>, shared: Arc<Shared>) {
+    let actor = Actor {
+        client,
+        shared,
+        pending: Vec::new(),
+        feedback: Feedback::default(),
+        stopping: false,
+    };
+    actor.run(inbox).await;
+}
+
+/// The session task: writes requests as commands arrive and matches responses to
+/// them by CSeq, so requests are pipelined like pyatv's and nothing waits behind a
+/// slow response.
+struct Actor {
+    client: RtspClient,
     shared: Arc<Shared>,
-) {
-    let mut feedback = Feedback::default();
-    // Set by Teardown: the receiver may now close the connection, which is no
-    // longer a reason to report.
-    let mut stopping = false;
-    loop {
-        let reading = !client.is_closed() && !stopping;
-        tokio::select! {
-            command = inbox.recv() => match command {
-                Some(Command::Request { request, reply }) => {
-                    let result = client.exchange(&request).await;
-                    if let Err(err) = &result
-                        && !stopping
-                    {
-                        note_connection(&client, err, &shared);
-                    }
-                    if reply.send(result).is_err() {
-                        debug!("request caller went away");
-                    }
+    /// Requests on the wire (a handful at most: feedback, a command, TEARDOWN).
+    pending: Vec<Pending>,
+    feedback: Feedback,
+    /// Set by Teardown: the receiver may now close the connection, which is no
+    /// longer a reason to report, and feedback results no longer matter.
+    stopping: bool,
+}
+
+impl Actor {
+    async fn run(mut self, mut inbox: mpsc::Receiver<Command>) {
+        loop {
+            let deadline = self.pending.iter().map(|p| p.deadline).min();
+            let feedback_due = self.feedback.next;
+            // Every read error closes the client, so this cannot spin.
+            let reading = !self.client.is_closed();
+            tokio::select! {
+                command = inbox.recv() => match command {
+                    Some(Command::Close) | None => break,
+                    Some(command) => self.handle(command).await,
+                },
+                () = sleep_until(feedback_due), if feedback_due.is_some() => {
+                    self.send_feedback().await;
                 }
-                Some(Command::StartFeedback { reply }) => {
-                    send_feedback(&mut client, &mut feedback, &shared).await;
-                    // The caller may have been cancelled; nothing to do then.
-                    let _ = reply.send(());
+                () = sleep_until(deadline), if deadline.is_some() => {
+                    self.expire(Instant::now());
                 }
-                Some(Command::Teardown { reply }) => {
-                    feedback.next = None;
-                    stopping = true;
-                    if client.is_closed() {
-                        debug!("connection already closed; no TEARDOWN");
-                    } else {
-                        let request = RtspRequest::new("TEARDOWN").header("Session", "0");
-                        let exchange = client.exchange(&request);
-                        match tokio::time::timeout(TEARDOWN_TIMEOUT, exchange).await {
-                            Ok(Ok(_)) => debug!("TEARDOWN accepted"),
-                            Ok(Err(err)) => debug!("TEARDOWN failed: {err}"),
-                            Err(_) => debug!("TEARDOWN timed out"),
-                        }
-                    }
-                    // The caller may have been cancelled; nothing to do then.
-                    let _ = reply.send(());
-                }
-                Some(Command::Close) | None => break,
-            },
-            () = sleep_until(feedback.next), if feedback.next.is_some() => {
-                send_feedback(&mut client, &mut feedback, &shared).await;
+                // Cancel-safe, so a command or timer can interrupt it at any point.
+                result = self.client.next_response(), if reading => match result {
+                    Ok(response) => self.dispatch(response),
+                    Err(err) => self.connection_lost(&err),
+                },
             }
-            result = client.read_some(), if reading => {
-                if let Err(err) = result {
-                    note_connection(&client, &err, &shared);
-                    feedback.next = None;
+        }
+        self.client.shutdown().await;
+    }
+
+    /// Act on one command (`Close` is handled by the loop).
+    async fn handle(&mut self, command: Command) {
+        match command {
+            Command::Request { request, reply } => {
+                let deadline = Instant::now() + REQUEST_TIMEOUT;
+                self.start(&request, deadline, Waiter::Request(reply)).await;
+            }
+            Command::StartFeedback { reply } => {
+                let outstanding = self
+                    .pending
+                    .iter()
+                    .any(|p| matches!(p.waiter, Waiter::Feedback));
+                if !outstanding {
+                    self.send_feedback().await;
                 }
+                // The caller may have been cancelled; nothing to do then.
+                let _ = reply.send(());
+            }
+            Command::Teardown { deadline, reply } => {
+                self.feedback.next = None;
+                self.stopping = true;
+                if self.client.is_closed() {
+                    debug!("connection already closed; no TEARDOWN");
+                    let _ = reply.send(());
+                } else {
+                    let request = RtspRequest::new("TEARDOWN").header("Session", "0");
+                    self.start(&request, deadline, Waiter::Teardown(reply))
+                        .await;
+                }
+            }
+            // Stops the loop in `run` before it gets here.
+            Command::Close => {}
+        }
+    }
+
+    /// Write `request` and remember who waits for its response; a failed write
+    /// answers the waiter at once.
+    async fn start(&mut self, request: &RtspRequest, deadline: Instant, waiter: Waiter) {
+        match self.client.send_request(request).await {
+            Ok(cseq) => self.pending.push(Pending {
+                cseq,
+                method: request.method.clone(),
+                allow_error: request.allow_error,
+                label: request.describe(cseq),
+                deadline,
+                waiter,
+            }),
+            Err(err) => {
+                if !self.stopping {
+                    note_connection(&self.client, &err, &self.shared);
+                }
+                self.complete(waiter, Err(err));
             }
         }
     }
-    client.shutdown().await;
+
+    /// Write the next POST /feedback; the one after is scheduled when it finishes.
+    async fn send_feedback(&mut self) {
+        self.feedback.next = None;
+        let request = RtspRequest::new("POST").uri("/feedback");
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        self.start(&request, deadline, Waiter::Feedback).await;
+    }
+
+    /// Hand a response to the request with its CSeq.
+    fn dispatch(&mut self, response: Response) {
+        let cseq = response.cseq();
+        let Some(index) = self.pending.iter().position(|p| Some(p.cseq) == cseq) else {
+            debug!(?cseq, "skipping response without a waiting request");
+            return;
+        };
+        let pending = self.pending.remove(index);
+        trace!(code = response.code, cseq = pending.cseq, "RTSP response");
+        let result = rtsp::check_status(&pending.method, response, pending.allow_error);
+        self.complete(pending.waiter, result);
+    }
+
+    /// Fail every request whose deadline has passed.
+    fn expire(&mut self, now: Instant) {
+        while let Some(index) = self.pending.iter().position(|p| p.deadline <= now) {
+            let pending = self.pending.remove(index);
+            self.complete(pending.waiter, Err(RtspError::Timeout(pending.label)));
+        }
+    }
+
+    /// The connection failed or was closed: fail everything still waiting.
+    fn connection_lost(&mut self, err: &RtspError) {
+        if !self.stopping {
+            note_connection(&self.client, err, &self.shared);
+        }
+        self.feedback.next = None;
+        for pending in std::mem::take(&mut self.pending) {
+            self.complete(pending.waiter, Err(connection_error(err)));
+        }
+    }
+
+    /// Deliver the outcome of a request to whoever waits for it.
+    fn complete(&mut self, waiter: Waiter, result: Result<Response, RtspError>) {
+        match waiter {
+            Waiter::Request(reply) => {
+                if reply.send(result).is_err() {
+                    debug!("request caller went away");
+                }
+            }
+            Waiter::Feedback => self.feedback_done(result),
+            Waiter::Teardown(reply) => {
+                match &result {
+                    Ok(_) => debug!("TEARDOWN accepted"),
+                    Err(err) => debug!("TEARDOWN failed: {err}"),
+                }
+                // The caller may have given up; nothing to do then.
+                let _ = reply.send(());
+            }
+        }
+    }
+
+    /// Account for one feedback round trip and schedule the next one.
+    fn feedback_done(&mut self, result: Result<Response, RtspError>) {
+        if self.stopping {
+            return;
+        }
+        match result {
+            Ok(response) => {
+                self.feedback.failures = 0;
+                if !response.body.is_empty() {
+                    match response.body_plist() {
+                        Ok(plist) => {
+                            *self.shared.last_feedback.lock() =
+                                Some(bodies::describe_plist(&plist));
+                        }
+                        Err(err) => debug!("feedback body is not a plist: {err}"),
+                    }
+                }
+            }
+            Err(err) => {
+                self.feedback.failures += 1;
+                debug!(failures = self.feedback.failures, "feedback failed: {err}");
+                if self.feedback.failures >= FEEDBACK_FAILURE_LIMIT {
+                    self.shared.set_end_reason(format!(
+                        "receiver stopped answering feedback ({} failures, last: {err})",
+                        self.feedback.failures
+                    ));
+                }
+            }
+        }
+        self.feedback.next = (!self.client.is_closed()).then(|| Instant::now() + FEEDBACK_INTERVAL);
+    }
 }
 
 #[cfg(test)]
@@ -765,6 +944,26 @@ mod tests {
         assert!(matches!(
             SessionError::from(BodyError::Missing("dataPort")),
             SessionError::Protocol(_)
+        ));
+    }
+
+    #[test]
+    fn connection_errors_are_copied_for_every_waiter() {
+        assert!(matches!(
+            connection_error(&RtspError::Closed),
+            RtspError::Closed
+        ));
+        let reset = RtspError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ));
+        assert!(matches!(
+            connection_error(&reset),
+            RtspError::Io(err) if err.kind() == std::io::ErrorKind::ConnectionReset
+        ));
+        assert!(matches!(
+            connection_error(&RtspError::Parse("bad".into())),
+            RtspError::Io(err) if err.kind() == std::io::ErrorKind::InvalidData
         ));
     }
 
