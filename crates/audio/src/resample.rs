@@ -16,9 +16,12 @@
 //! hold-back is the filter's own delay ([`StereoResampler::output_delay`], about
 //! 1.3 ms at 48 kHz), which [`StereoResampler::flush`] can push out with zero padding
 //! (`Indexing::partial_len(0)`). Capture does not flush: when it goes quiet it
-//! [`reset`](StereoResampler::reset)s the filter instead, because by the time it
-//! notices, the sender has already filled that span with silence, and the next
-//! sound must not start with the end of the previous one.
+//! [`reset`](StereoResampler::reset)s the filter instead, so the next sound never
+//! starts with the end of the previous one. It notices after 200 ms, which at
+//! latencies up to about 275 ms is at or after the sender's stall, where a flushed
+//! tail would land after the silence already sent. At longer latencies the sender
+//! stalls a little later (at most 250 ms) and the ~1.3 ms tail is simply lost; that
+//! is accepted (see `capture::WAIT_TIMEOUT`).
 
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{

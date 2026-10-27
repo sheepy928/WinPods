@@ -92,9 +92,17 @@ pub enum CaptureError {
 pub const BUFFER_DURATION: Duration = Duration::from_millis(100);
 /// Longest wait for a packet before the loop drains anyway. A timeout with nothing
 /// queued means capture went quiet: the resampler is then reset, dropping the ~1.3 ms
-/// tail it still holds instead of publishing it. By now the sender has been sending
-/// silence for that span for a long time (it pads after 40 ms of quiet), so the tail
-/// would arrive out of place, and the next sound starts from a clean filter.
+/// tail it still holds instead of publishing it, so the next sound starts from a
+/// clean filter.
+///
+/// The reset lands around the sender's own stall. The sender pads with silence after
+/// `max(latency - render - 5 ms clamped to 5..=250 ms, 40 ms)` of quiet
+/// (`StallPolicy::stall_ns` in winpods-airplay), which is at or before these 200 ms
+/// for latencies up to about 275 ms (the default is 100 ms). There a published tail
+/// would land after the silence already sent, out of place. With a longer latency
+/// the sender stalls at 201-250 ms, after the reset, and the tail could still have
+/// been padded in with the remainder; it is lost instead. Losing ~1.3 ms of a sound's
+/// end is accepted so capture does not depend on the sender's timing.
 pub const WAIT_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// State shared between the handle and its thread.
@@ -541,9 +549,10 @@ impl PacketConverter {
 
     /// End of one wake of the capture loop. When the wait timed out and no packet
     /// was drained, capture went quiet: reset the resampler (see [`WAIT_TIMEOUT`])
-    /// rather than publish its tail ~200 ms late, where the sender would put it after
-    /// the silence it already sent. Returns true when it reset (once per sound: not
-    /// again until more audio was converted). Never allocates.
+    /// rather than publish its tail ~200 ms late, where (at the usual latencies) the
+    /// sender would put it after the silence it already sent. Returns true when it
+    /// reset (once per sound: not again until more audio was converted). Never
+    /// allocates.
     fn after_wake(&mut self, signaled: bool, drained: usize) -> bool {
         if signaled || drained > 0 || !self.resampler.has_tail() {
             return false;
@@ -1026,9 +1035,9 @@ mod tests {
         assert_eq!(count(), 4);
     }
 
-    /// The idle timeout comes 200 ms after capture went quiet, long after the sender
-    /// started padding with silence: the resampler's tail is dropped there, never
-    /// published late or prepended to the next sound.
+    /// The idle timeout comes 200 ms after capture went quiet (at or after the
+    /// sender's stall for latencies up to ~275 ms): the resampler's tail is dropped
+    /// there, never published late or prepended to the next sound.
     #[test]
     fn idle_timeout_resets_the_resampler_instead_of_publishing_its_tail() {
         let counter = AtomicU64::new(0);
