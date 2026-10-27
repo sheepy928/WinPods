@@ -449,6 +449,12 @@ impl Inner {
             }
             Command::SetDeviceIp(address) => {
                 let address = address.trim().to_string();
+                if address == self.snap.device_ip {
+                    return;
+                }
+                // Like the Python engine: a new address forgets the old receiver's name
+                // until it is discovered again.
+                self.snap.discovered_device_name = None;
                 let known = SPEAKERS.iter().find(|(_, ip, _)| *ip == address);
                 self.snap.device_name = known.map(|s| s.0.to_string()).unwrap_or_default();
                 self.snap.device_model = known.map(|s| s.2.to_string()).unwrap_or_default();
@@ -572,6 +578,36 @@ mod tests {
         let snap = engine.snapshot();
         assert_eq!(snap.state, State::Error);
         assert!(!snap.error.is_empty());
+        // A second attempt stays in Error (no transition): the UI must still give up.
+        engine.shared.apply(Command::Connect, t0);
+        let again = engine.snapshot();
+        assert_eq!(again.state, State::Error);
+        assert!(view::engine_gave_up(&again, ""));
+    }
+
+    #[test]
+    fn new_address_forgets_the_discovered_name() {
+        let engine = MockEngine::manual();
+        let t0 = Instant::now();
+        engine.shared.apply(Command::Connect, t0);
+        engine.shared.tick(t0 + CONNECT_TIME);
+        assert_eq!(
+            engine.snapshot().discovered_device_name.as_deref(),
+            Some("Living Room")
+        );
+        // Re-sending the same address keeps it.
+        engine
+            .shared
+            .apply(Command::SetDeviceIp(" 192.168.1.42 ".into()), t0);
+        assert!(engine.snapshot().discovered_device_name.is_some());
+        engine.shared.apply(Command::Disconnect, t0);
+        engine
+            .shared
+            .apply(Command::SetDeviceIp("192.168.1.99".into()), t0);
+        let snap = engine.snapshot();
+        assert_eq!(snap.discovered_device_name, None);
+        assert_eq!(snap.device_name, "");
+        assert_eq!(view::name_to_persist(&snap, "192.168.1.99", ""), None);
     }
 
     #[test]

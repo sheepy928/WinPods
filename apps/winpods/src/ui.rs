@@ -145,8 +145,6 @@ const VOLUME_TRAILING: Duration = Duration::from_millis(150);
 const TOGGLE_DEBOUNCE: Duration = Duration::from_millis(400);
 /// How often the tray health check runs.
 const TRAY_MAINTAIN_EVERY: Duration = Duration::from_secs(1);
-/// How long a requested scan may take to show up as Running.
-const SCAN_START_GRACE: Duration = Duration::from_millis(1500);
 /// Default volume shown when the speaker volume is not controlled.
 const DEFAULT_VOLUME: f32 = 40.0;
 /// Project page.
@@ -197,13 +195,87 @@ enum UpdateRequest {
     Skip(Option<String>),
 }
 
+/// What the update machinery is doing. Checking and installing are tracked apart so
+/// that a background check finishing during a download cannot re-enable "Install".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum UpdatePhase {
+    #[default]
+    Idle,
+    /// A manual "Check now" is in flight.
+    Checking,
+    /// Downloading, verifying and swapping in a release (ends with a restart or an error).
+    Installing,
+}
+
 /// Update banner state.
 #[derive(Default)]
 struct UpdateUi {
     available: Option<Release>,
-    busy: bool,
+    phase: UpdatePhase,
     status: String,
     can_install: bool,
+}
+
+impl UpdateUi {
+    /// Buttons that start update work are disabled while this is true.
+    fn busy(&self) -> bool {
+        self.phase != UpdatePhase::Idle
+    }
+
+    /// Start a manual check; false while a check or an install is already running.
+    fn begin_check(&mut self) -> bool {
+        if self.busy() {
+            return false;
+        }
+        self.phase = UpdatePhase::Checking;
+        self.status = "Checking for updates…".to_string();
+        true
+    }
+
+    /// Show the result of a manual or automatic check finished at `now_unix`. While an
+    /// install runs the banner is left alone (returns false): the result must neither
+    /// end the install state nor replace the download progress.
+    fn finish_check(&mut self, result: Result<Option<Release>, String>, now_unix: u64) -> bool {
+        if self.phase == UpdatePhase::Installing {
+            return false;
+        }
+        self.phase = UpdatePhase::Idle;
+        match result {
+            Ok(release) => {
+                self.status = match &release {
+                    Some(r) => format!("Version {} is available", r.version),
+                    None => format!(
+                        "WinPods is up to date · checked {}",
+                        view::format_ago(now_unix, now_unix)
+                    ),
+                };
+                self.available = release;
+            }
+            Err(err) => self.status = format!("Could not check for updates: {err}"),
+        }
+        true
+    }
+
+    /// Enter the install state; returns the release to install, or `None` when there is
+    /// nothing to install or other update work is running.
+    fn begin_install(&mut self) -> Option<Release> {
+        if self.busy() {
+            return None;
+        }
+        let release = self.available.clone()?;
+        self.phase = UpdatePhase::Installing;
+        self.status = "Downloading…".to_string();
+        Some(release)
+    }
+
+    /// The install failed: back to idle with the error shown.
+    fn install_failed(&mut self, message: &str, offer_release_page: bool) {
+        self.phase = UpdatePhase::Idle;
+        self.status = format!("Update failed: {message}");
+        if offer_release_page {
+            self.can_install = false;
+        }
+    }
 }
 
 /// Mutable UI-thread state.
@@ -214,11 +286,11 @@ struct UiState {
     wants: bool,
     quitting: bool,
     last_snapshot: Option<Arc<Snapshot>>,
-    last_state: State,
     devices: Option<Arc<Vec<DeviceInfo>>>,
     sources: Vec<CaptureSelection>,
+    /// Rows currently in the Find popup (index = row of `App.scan-results`).
     scan_results: Vec<ScanResult>,
-    scan_requested: Option<Instant>,
+    scan: view::ScanTracker,
     volume: VolumeThrottle,
     meter: f32,
     last_meter_at: Instant,
@@ -365,11 +437,10 @@ impl Controller {
                 wants: false,
                 quitting: false,
                 last_snapshot: None,
-                last_state: snapshot.state,
                 devices: None,
                 sources: Vec::new(),
                 scan_results: Vec::new(),
-                scan_requested: None,
+                scan: view::ScanTracker::default(),
                 volume: VolumeThrottle::default(),
                 meter: 0.0,
                 last_meter_at: now,
@@ -816,14 +887,11 @@ impl Controller {
             let mut s = self.state.borrow_mut();
             s.last_snapshot = Some(Arc::clone(snap));
             let has_address = !view::effective_address(snap, &s.config.device_ip).is_empty();
-            let mut wants_changed = false;
-            if snap.state != s.last_state {
-                s.last_state = snap.state;
-                // The engine gives up when there is no address to connect to.
-                if snap.state == State::Error && !has_address && s.wants {
-                    s.wants = false;
-                    wants_changed = true;
-                }
+            // The engine gives up (and stays in Error) when there is no address to
+            // connect to; checked on every snapshot, not only on state transitions.
+            let wants_changed = s.wants && view::engine_gave_up(snap, &s.config.device_ip);
+            if wants_changed {
+                s.wants = false;
             }
             let devices_changed = s
                 .devices
@@ -832,13 +900,13 @@ impl Controller {
             if devices_changed {
                 s.devices = Some(Arc::clone(&snap.devices));
             }
-            let mut save = false;
-            if let Some(name) = &snap.discovered_device_name
-                && !name.is_empty()
-                && *name != s.config.device_name
-            {
-                s.config.device_name = name.clone();
-                save = true;
+            // Only a name discovered for the configured address is saved.
+            let discovered =
+                view::name_to_persist(snap, &s.config.device_ip, &s.config.device_name)
+                    .map(str::to_string);
+            let save = discovered.is_some();
+            if let Some(name) = discovered {
+                s.config.device_name = name;
             }
             let title = view::speaker_title(snap, &s.config.device_name, &s.config.device_ip);
             let detail = view::speaker_detail(snap, &s.config.device_ip);
@@ -904,7 +972,17 @@ impl Controller {
     }
 
     fn set_connection(&self, on: bool) {
-        self.set_wants(on);
+        // Without an address the engine refuses (and reports why in the snapshot), so
+        // the switch springs back instead of staying on while nothing connects.
+        let possible = on && {
+            let s = self.state.borrow();
+            let snapshot = s
+                .last_snapshot
+                .clone()
+                .unwrap_or_else(|| self.engine.snapshot());
+            !view::effective_address(&snapshot, &s.config.device_ip).is_empty()
+        };
+        self.set_wants(possible);
         self.engine.send(if on {
             Command::Connect
         } else {
@@ -1096,26 +1174,25 @@ impl Controller {
 
     fn find_speakers(&self) {
         self.engine.send(Command::Scan);
-        self.state.borrow_mut().scan_requested = Some(Instant::now());
+        {
+            let mut s = self.state.borrow_mut();
+            s.scan.request(Instant::now());
+            s.scan_results.clear();
+        }
         let app = self.app();
         app.set_scan_running(true);
         app.set_scan_message(shared(view::scan_view(&ScanState::Running).message));
         app.set_scan_results(ModelRc::new(VecModel::<ScanRow>::default()));
     }
 
+    /// Refresh the Find popup, but only when the scan state changed: replacing the
+    /// rows' model mid-click would destroy the pressed row and lose the click.
     fn apply_scan(&self, scan: &ScanState) {
         let results = {
             let mut s = self.state.borrow_mut();
-            if let Some(requested) = s.scan_requested {
-                let started = matches!(scan, ScanState::Running);
-                if started || requested.elapsed() > SCAN_START_GRACE {
-                    s.scan_requested = None;
-                } else {
-                    // Still showing the previous scan's result; keep "searching".
-                    return;
-                }
-            }
-            let view = view::scan_view(scan);
+            let Some(view) = s.scan.update(scan, Instant::now()) else {
+                return;
+            };
             s.scan_results = view.results.clone();
             view
         };
@@ -1272,7 +1349,7 @@ impl Controller {
                 .unwrap_or_default(),
         ));
         app.set_update_status(shared(&update.status));
-        app.set_update_busy(update.busy);
+        app.set_update_busy(update.busy());
         app.set_update_can_install(update.can_install);
     }
 
@@ -1310,13 +1387,8 @@ impl Controller {
     }
 
     fn check_updates(&self) {
-        {
-            let mut s = self.state.borrow_mut();
-            if s.update.busy {
-                return;
-            }
-            s.update.busy = true;
-            s.update.status = "Checking for updates…".to_string();
+        if !self.state.borrow_mut().update.begin_check() {
+            return;
         }
         self.push_update_ui();
         if self.demo {
@@ -1337,30 +1409,21 @@ impl Controller {
         }
     }
 
+    /// Result of a manual or automatic check (automatic ones arrive at any time, also
+    /// while an install is running; the banner then keeps showing the install).
     fn update_checked(&self, result: Result<Option<Release>, String>) {
-        let mut save = false;
-        {
+        let now = unix_now();
+        let save = {
             let mut s = self.state.borrow_mut();
-            s.update.busy = false;
-            match result {
-                Ok(release) => {
-                    let now = unix_now();
-                    if !self.demo {
-                        s.config.last_update_check = Some(now);
-                        save = true;
-                    }
-                    s.update.status = match &release {
-                        Some(r) => format!("Version {} is available", r.version),
-                        None => format!(
-                            "WinPods is up to date · checked {}",
-                            view::format_ago(now, now)
-                        ),
-                    };
-                    s.update.available = release;
-                }
-                Err(err) => s.update.status = format!("Could not check for updates: {err}"),
+            let save = result.is_ok() && !self.demo;
+            if save {
+                s.config.last_update_check = Some(now);
             }
-        }
+            if !s.update.finish_check(result, now) {
+                tracing::debug!("update check finished during an install; banner unchanged");
+            }
+            save
+        };
         if save {
             self.save_config();
         }
@@ -1374,7 +1437,7 @@ impl Controller {
             (
                 s.update.available.clone(),
                 s.update.can_install,
-                s.update.busy,
+                s.update.busy(),
             )
         };
         let Some(release) = release else {
@@ -1396,11 +1459,11 @@ impl Controller {
         let Some(updater) = self.updater.clone() else {
             return;
         };
-        {
-            let mut s = self.state.borrow_mut();
-            s.update.busy = true;
-            s.update.status = "Downloading…".to_string();
-        }
+        // Enter the install state before the thread starts: from here until a restart
+        // or a failure, nothing (not even a background check) re-enables "Install".
+        let Some(release) = self.state.borrow_mut().update.begin_install() else {
+            return;
+        };
         self.push_update_ui();
         let spawned = std::thread::Builder::new()
             .name("update-install".into())
@@ -1439,14 +1502,10 @@ impl Controller {
                 self.begin_shutdown(true);
             }
             Err((message, offer_release_page)) => {
-                {
-                    let mut s = self.state.borrow_mut();
-                    s.update.busy = false;
-                    s.update.status = format!("Update failed: {message}");
-                    if offer_release_page {
-                        s.update.can_install = false;
-                    }
-                }
+                self.state
+                    .borrow_mut()
+                    .update
+                    .install_failed(&message, offer_release_page);
                 self.push_update_ui();
             }
         }
@@ -1455,6 +1514,9 @@ impl Controller {
     fn skip_update(&self) {
         let tag = {
             let mut s = self.state.borrow_mut();
+            if s.update.busy() {
+                return;
+            }
             let Some(release) = s.update.available.take() else {
                 return;
             };
@@ -1554,6 +1616,51 @@ mod tests {
         assert!(release.version > winpods_app::updater::current_version());
         assert!(release.html_url.starts_with(PROJECT_URL));
         assert_eq!(release.tag, format!("v{}", release.version));
+    }
+
+    #[test]
+    fn manual_checks_do_not_overlap() {
+        let mut update = UpdateUi::default();
+        assert!(update.begin_check());
+        assert!(update.busy());
+        assert!(!update.begin_check());
+        assert!(update.finish_check(Ok(None), 1_000));
+        assert!(!update.busy());
+        assert!(update.status.starts_with("WinPods is up to date"));
+        assert!(update.begin_check());
+        assert!(update.finish_check(Err("offline".into()), 1_000));
+        assert_eq!(update.status, "Could not check for updates: offline");
+        assert!(!update.busy());
+    }
+
+    #[test]
+    fn background_check_cannot_end_an_install() {
+        let mut update = UpdateUi::default();
+        // Nothing to install yet.
+        assert!(update.begin_install().is_none());
+        // An automatic check (no begin_check) offers a release.
+        assert!(update.finish_check(Ok(Some(demo_release())), 1_000));
+        assert!(!update.busy());
+        let release = update.begin_install().expect("release to install");
+        assert_eq!(release.tag, "v0.3.0");
+        assert_eq!(update.phase, UpdatePhase::Installing);
+        update.status = "Downloading… 40%".to_string();
+
+        // The 24 h / retry check lands mid-download: the banner keeps the install.
+        assert!(!update.finish_check(Ok(None), 2_000));
+        assert!(!update.finish_check(Err("offline".into()), 2_000));
+        assert_eq!(update.phase, UpdatePhase::Installing);
+        assert_eq!(update.status, "Downloading… 40%");
+        assert!(update.available.is_some());
+        // So neither a second install nor a manual check can start.
+        assert!(update.begin_install().is_none());
+        assert!(!update.begin_check());
+
+        update.install_failed("signature mismatch", true);
+        assert!(!update.busy());
+        assert!(!update.can_install);
+        assert_eq!(update.status, "Update failed: signature mismatch");
+        assert!(update.begin_install().is_some());
     }
 
     #[test]

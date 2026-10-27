@@ -208,6 +208,32 @@ pub fn effective_address<'a>(snap: &'a Snapshot, saved_ip: &'a str) -> &'a str {
     }
 }
 
+/// The engine has given up connecting because no receiver address is set anywhere.
+///
+/// Evaluated on every snapshot (not only on state transitions): the engine stays in
+/// `Error` across repeated Connect attempts without an address, so a transition-only
+/// check would leave the Connect switch on after the second attempt.
+pub fn engine_gave_up(snap: &Snapshot, saved_ip: &str) -> bool {
+    snap.state == State::Error && effective_address(snap, saved_ip).is_empty()
+}
+
+/// The engine-discovered receiver name to persist in config, if any.
+///
+/// Only a name reported for the configured address counts: after the user changes the
+/// address, snapshots can still carry the previous receiver's name (until the engine
+/// handles `SetDeviceIp` and rediscovers), and saving it would label the new address
+/// with the old speaker's name.
+pub fn name_to_persist<'a>(
+    snap: &'a Snapshot,
+    saved_ip: &str,
+    saved_name: &str,
+) -> Option<&'a str> {
+    let name = snap.discovered_device_name.as_deref()?.trim();
+    let engine_ip = snap.device_ip.trim();
+    let for_saved_address = !engine_ip.is_empty() && engine_ip == saved_ip.trim();
+    (for_saved_address && !name.is_empty() && name != saved_name.trim()).then_some(name)
+}
+
 /// Title of the speaker card.
 pub fn speaker_title(snap: &Snapshot, saved_name: &str, saved_ip: &str) -> String {
     if !snap.device_name.trim().is_empty() {
@@ -460,6 +486,52 @@ pub fn scan_view(state: &ScanState) -> ScanView {
             message: format!("Scan failed: {error}"),
             results: Vec::new(),
         },
+    }
+}
+
+/// How long a requested scan may take to show up as `Running` before the engine's
+/// current scan state is shown again.
+pub const SCAN_START_GRACE: Duration = Duration::from_millis(1500);
+
+/// Decides when the Find popup must be refreshed from the engine's scan state.
+///
+/// The engine publishes a new snapshot whenever any statistic changes, but the popup's
+/// rows must only be rebuilt when the scan state itself changes: replacing the rows'
+/// model destroys the row being clicked between press and release, so the click is lost.
+#[derive(Debug, Clone, Default)]
+pub struct ScanTracker {
+    /// Scan state currently shown (`None`: nothing shown yet, or rows were cleared).
+    applied: Option<ScanState>,
+    /// When the user asked for a scan that the engine has not reported as running yet.
+    requested: Option<Instant>,
+}
+
+impl ScanTracker {
+    /// The user asked for a scan at `now` and the popup was cleared to "searching": the
+    /// previous result is not shown again until the engine reports the new scan (or
+    /// [`SCAN_START_GRACE`] passes), and the next state is always applied.
+    pub fn request(&mut self, now: Instant) {
+        self.requested = Some(now);
+        self.applied = None;
+    }
+
+    /// The popup contents to show for `scan`, or `None` when the popup is already up to
+    /// date (or still waiting for a requested scan to start).
+    pub fn update(&mut self, scan: &ScanState, now: Instant) -> Option<ScanView> {
+        if let Some(requested) = self.requested {
+            let started = matches!(scan, ScanState::Running);
+            if started || now.saturating_duration_since(requested) > SCAN_START_GRACE {
+                self.requested = None;
+            } else {
+                // Still the previous scan's state; keep showing "searching".
+                return None;
+            }
+        }
+        if self.applied.as_ref() == Some(scan) {
+            return None;
+        }
+        self.applied = Some(scan.clone());
+        Some(scan_view(scan))
     }
 }
 
@@ -879,6 +951,128 @@ mod tests {
         assert_eq!(scan_row_detail(&found[1]), "10.0.0.3");
         let failed = scan_view(&ScanState::Failed("no network".into()));
         assert_eq!(failed.message, "Scan failed: no network");
+    }
+
+    fn found(names: &[&str]) -> ScanState {
+        ScanState::Done(Arc::new(
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| ScanResult {
+                    name: (*name).to_string(),
+                    address: format!("10.0.0.{}", i + 2),
+                    model: String::new(),
+                })
+                .collect(),
+        ))
+    }
+
+    #[test]
+    fn scan_tracker_only_reports_changes() {
+        let t0 = Instant::now();
+        let mut tracker = ScanTracker::default();
+        assert!(tracker.update(&ScanState::Idle, t0).is_some());
+        // Republished snapshots with the same scan state leave the rows alone.
+        assert!(tracker.update(&ScanState::Idle, t0).is_none());
+        let done = found(&["Living Room", "Kitchen"]);
+        let view = tracker.update(&done, t0).expect("new result");
+        assert_eq!(view.results.len(), 2);
+        assert!(tracker.update(&done, t0).is_none());
+        // An equal list in a fresh Arc is not a change either.
+        assert!(
+            tracker
+                .update(&found(&["Living Room", "Kitchen"]), t0)
+                .is_none()
+        );
+        assert!(tracker.update(&found(&["Kitchen"]), t0).is_some());
+    }
+
+    #[test]
+    fn scan_tracker_waits_for_a_requested_scan() {
+        let t0 = Instant::now();
+        let mut tracker = ScanTracker::default();
+        let old = found(&["Living Room"]);
+        assert!(tracker.update(&old, t0).is_some());
+        tracker.request(t0);
+        // The previous result is not shown again while the new scan starts.
+        assert!(
+            tracker
+                .update(&old, t0 + Duration::from_millis(100))
+                .is_none()
+        );
+        let running = tracker
+            .update(&ScanState::Running, t0 + Duration::from_millis(200))
+            .expect("scan started");
+        assert!(running.running);
+        assert!(
+            tracker
+                .update(&ScanState::Running, t0 + Duration::from_millis(300))
+                .is_none()
+        );
+        assert!(tracker.update(&old, t0 + Duration::from_secs(3)).is_some());
+
+        // An engine that never reports Running: after the grace period the (cleared)
+        // popup shows its state again, even though it equals the one shown before.
+        tracker.request(t0);
+        assert!(
+            tracker
+                .update(&old, t0 + Duration::from_millis(10))
+                .is_none()
+        );
+        let shown = tracker.update(&old, t0 + SCAN_START_GRACE + Duration::from_millis(1));
+        assert_eq!(shown.map(|v| v.results.len()), Some(1));
+    }
+
+    #[test]
+    fn engine_gives_up_only_without_any_address() {
+        let error = Snapshot {
+            state: State::Error,
+            ..Snapshot::default()
+        };
+        assert!(engine_gave_up(&error, ""));
+        assert!(engine_gave_up(&error, "  "));
+        // The UI already knows an address the engine has not received yet.
+        assert!(!engine_gave_up(&error, "10.0.0.2"));
+        let with_ip = Snapshot {
+            device_ip: "10.0.0.2".into(),
+            ..error.clone()
+        };
+        assert!(!engine_gave_up(&with_ip, ""));
+        let disconnected = Snapshot::default();
+        assert!(!engine_gave_up(&disconnected, ""));
+    }
+
+    #[test]
+    fn discovered_names_are_persisted_only_for_the_saved_address() {
+        let snap = Snapshot {
+            device_ip: "10.0.0.2".into(),
+            discovered_device_name: Some("Living Room".into()),
+            ..Snapshot::default()
+        };
+        assert_eq!(name_to_persist(&snap, "10.0.0.2", ""), Some("Living Room"));
+        assert_eq!(
+            name_to_persist(&snap, " 10.0.0.2 ", "Old"),
+            Some("Living Room")
+        );
+        // Already saved.
+        assert_eq!(name_to_persist(&snap, "10.0.0.2", "Living Room"), None);
+        // The user switched to another address: the old receiver's name is stale.
+        assert_eq!(name_to_persist(&snap, "10.0.0.9", ""), None);
+        let no_engine_ip = Snapshot {
+            device_ip: String::new(),
+            ..snap.clone()
+        };
+        assert_eq!(name_to_persist(&no_engine_ip, "", ""), None);
+        let blank = Snapshot {
+            discovered_device_name: Some("  ".into()),
+            ..snap.clone()
+        };
+        assert_eq!(name_to_persist(&blank, "10.0.0.2", ""), None);
+        let none = Snapshot {
+            discovered_device_name: None,
+            ..snap
+        };
+        assert_eq!(name_to_persist(&none, "10.0.0.2", ""), None);
     }
 
     #[test]
