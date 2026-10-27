@@ -1,0 +1,12 @@
+// Placeholder window (the UI workstream replaces this file and adds the rest).
+import { Button, VerticalBox } from "std-widgets.slint";
+
+export component MainWindow inherits Window {
+    title: "WinPods";
+    preferred-width: 420px;
+    preferred-height: 560px;
+    VerticalBox {
+        Text { text: "WinPods"; font-size: 20px; }
+        Button { text: "Connect"; }
+    }
+}

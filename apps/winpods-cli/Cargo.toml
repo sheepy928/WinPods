@@ -1,0 +1,24 @@
+[package]
+name = "winpods-cli"
+description = "WinPods command line diagnostics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "winpods-cli"
+path = "src/main.rs"
+
+[dependencies]
+winpods-rt.workspace = true
+winpods-engine.workspace = true
+winpods-app.workspace = true
+winpods-airplay.workspace = true
+winpods-audio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+windows.workspace = true

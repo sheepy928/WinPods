@@ -1,0 +1,19 @@
+[package]
+name = "winpods-audio"
+description = "WASAPI capture (loopback and input), resampling to 44.1 kHz, device watch, test tone"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+winpods-rt.workspace = true
+wasapi.workspace = true
+rubato.workspace = true
+audioadapter-buffers.workspace = true
+tokio.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+windows.workspace = true

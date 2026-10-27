@@ -1,3 +1,4 @@
+/target/
 .venv/
 build/
 dist/
@@ -5,3 +6,6 @@ __pycache__/
 .pytest_cache/
 *.spec
 *.zip
+*.minisign.key
+*.key
+minisign.key

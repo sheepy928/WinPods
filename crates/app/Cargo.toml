@@ -1,0 +1,29 @@
+[package]
+name = "winpods-app"
+description = "WinPods application services: config, paths, logging, autostart, single instance, updater"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+getrandom.workspace = true
+windows.workspace = true
+windows-registry.workspace = true
+ureq.workspace = true
+semver.workspace = true
+sha2.workspace = true
+hex.workspace = true
+minisign-verify.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+minisign = "0.7"
+tempfile = "3"

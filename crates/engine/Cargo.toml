@@ -1,0 +1,20 @@
+[package]
+name = "winpods-engine"
+description = "WinPods supervisor: connects capture, session and stream runtime; status snapshots"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+winpods-rt.workspace = true
+winpods-airplay.workspace = true
+winpods-audio.workspace = true
+tokio.workspace = true
+arc-swap.workspace = true
+parking_lot.workspace = true
+mdns-sd.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

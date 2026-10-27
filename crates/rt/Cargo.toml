@@ -1,0 +1,12 @@
+[package]
+name = "winpods-rt"
+description = "Windows real-time helpers for WinPods: clock, events, timers, MMCSS, audio ring"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+rtrb.workspace = true
+windows.workspace = true

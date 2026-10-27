@@ -1,0 +1,30 @@
+[package]
+name = "winpods"
+description = "WinPods - stream Windows audio to a HomePod with low latency"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "WinPods"
+path = "src/main.rs"
+
+[dependencies]
+winpods-rt.workspace = true
+winpods-engine.workspace = true
+winpods-app.workspace = true
+winpods-airplay.workspace = true
+winpods-audio.workspace = true
+slint.workspace = true
+tray-icon.workspace = true
+raw-window-handle.workspace = true
+windows.workspace = true
+semver.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+slint-build.workspace = true
+winresource.workspace = true

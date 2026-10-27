@@ -1,0 +1,106 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/rt",
+    "crates/airplay",
+    "crates/audio",
+    "crates/engine",
+    "crates/app",
+    "apps/winpods",
+    "apps/winpods-cli",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT"
+repository = "https://github.com/sheepy928/WinPods"
+authors = ["Ziyang Huang"]
+
+[workspace.dependencies]
+# internal crates
+winpods-rt = { path = "crates/rt" }
+winpods-airplay = { path = "crates/airplay" }
+winpods-audio = { path = "crates/audio" }
+winpods-engine = { path = "crates/engine" }
+winpods-app = { path = "crates/app" }
+
+# GUI
+slint = { version = "1.18.1", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "accessibility",
+    "backend-winit",
+    "renderer-femtovg",
+    "renderer-software",
+    "raw-window-handle-06",
+] }
+slint-build = "1.18.1"
+tray-icon = "0.26"
+raw-window-handle = "0.6"
+
+# audio
+wasapi = "0.26"
+rubato = "5.0"
+audioadapter-buffers = "5.1"
+rtrb = "0.3"
+
+# crypto / protocol
+chacha20poly1305 = "0.11"
+hkdf = "0.13"
+sha2 = "0.11"
+num-bigint = "0.4"
+num-traits = "0.2"
+plist = "1.10"
+hex = "0.4"
+minisign-verify = "0.2"
+
+# networking / runtime
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
+socket2 = { version = "0.6", features = ["all"] }
+mdns-sd = "0.21"
+ureq = "3"
+
+# utilities
+arc-swap = "1"
+parking_lot = "0.12"
+uuid = { version = "1", features = ["v4", "v5"] }
+getrandom = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+semver = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+clap = { version = "4", features = ["derive"] }
+
+# Windows
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_Storage_FileSystem",
+    "Win32_Networking_WinSock",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+] }
+windows-registry = "0.6"
+winresource = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+panic = "unwind"
+
+# 3072-bit SRP modpow is painfully slow unoptimised; keep dependencies fast in dev builds.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test.package."*"]
+opt-level = 2
