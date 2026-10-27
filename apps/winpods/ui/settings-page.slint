@@ -1,0 +1,420 @@
+// Settings page: speaker address + Find popup, startup, updates, advanced, about.
+
+import { AboutSlint, Button, ComboBox, LineEdit, ScrollView, Spinner, TextEdit } from "std-widgets.slint";
+import { App, ScanRow } from "state.slint";
+import { Theme, Icons } from "theme.slint";
+import { Card, CardFrame, Caption, IconButton, InfoBar, Link, SectionTitle, SettingRow, SwitchRow } from "controls.slint";
+
+export component SettingsPage inherits Rectangle {
+    property <int> about-request: App.about-request;
+    property <bool> show-licenses: false;
+
+    changed about-request => {
+        scroller.content-y = max(scroller.visible-height - scroller.content-height, -about-title.y + 12px);
+    }
+
+    scroller := ScrollView {
+        horizontal-scrollbar-policy: always-off;
+        VerticalLayout {
+            padding-left: Theme.page-padding;
+            padding-right: Theme.page-padding;
+            padding-top: 12px;
+            padding-bottom: Theme.page-padding;
+            spacing: Theme.card-gap;
+            alignment: start;
+
+            // Header
+            HorizontalLayout {
+                spacing: 6px;
+                padding-bottom: 8px;
+                IconButton {
+                    icon: Icons.back;
+                    label: "Back";
+                    clicked => {
+                        App.page = 0;
+                    }
+                }
+                Text {
+                    text: "Settings";
+                    color: Theme.text;
+                    font-size: Theme.subtitle;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+            }
+
+            // ---------------------------------------------------------------- Speaker
+            SectionTitle {
+                text: "Speaker";
+                padding-top: 0px;
+            }
+            CardFrame {
+                VerticalLayout {
+                    padding-left: 16px;
+                    padding-right: 16px;
+                    padding-top: 11px;
+                    padding-bottom: 11px;
+                    spacing: 6px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 1px;
+                            horizontal-stretch: 1;
+                            Text {
+                                text: "IP address";
+                                color: Theme.text;
+                                wrap: word-wrap;
+                            }
+                            Caption {
+                                text: "IPv4 address of your HomePod";
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            ip-edit := LineEdit {
+                                width: 140px;
+                                text <=> App.speaker-ip;
+                                placeholder-text: "192.168.1.20";
+                                accessible-label: "Speaker IP address";
+                                accepted(text) => {
+                                    App.speaker-ip-accepted(text);
+                                }
+                                changed has-focus => {
+                                    if !self.has-focus {
+                                        App.speaker-ip-accepted(self.text);
+                                    }
+                                }
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            find-button := Button {
+                                text: "Find…";
+                                accessible-label: "Find speakers on the network";
+                                clicked => {
+                                    App.find-speakers();
+                                    find-popup.show();
+                                }
+                            }
+                        }
+                    }
+                    if App.speaker-ip-error != "": Caption {
+                        text: App.speaker-ip-error;
+                        color: Theme.error-text;
+                    }
+                }
+            }
+
+            // ---------------------------------------------------------------- Startup
+            SectionTitle {
+                text: "Startup";
+            }
+            SwitchRow {
+                title: "Start with Windows";
+                description: App.autostart-note != "" ? App.autostart-note : "Start in the notification area when you sign in";
+                enabled: App.autostart-available;
+                checked <=> App.start-with-windows;
+                toggled(on) => {
+                    App.start-with-windows-toggled(on);
+                }
+            }
+            if App.autostart-other-copy: SettingRow {
+                title: "Another copy starts with Windows";
+                description: "Start this copy at sign-in instead";
+                Button {
+                    text: "Use this copy";
+                    clicked => {
+                        App.use-this-copy();
+                    }
+                }
+            }
+            SwitchRow {
+                title: "Start minimized";
+                description: "Stay in the notification area when WinPods starts";
+                checked <=> App.start-minimized;
+                toggled(on) => {
+                    App.start-minimized-toggled(on);
+                }
+            }
+            SwitchRow {
+                title: "Connect automatically";
+                description: "Connect to the speaker as soon as WinPods starts";
+                checked <=> App.auto-connect;
+                toggled(on) => {
+                    App.auto-connect-toggled(on);
+                }
+            }
+
+            // ---------------------------------------------------------------- Updates
+            SectionTitle {
+                text: "Updates";
+            }
+            SwitchRow {
+                title: "Automatic updates";
+                description: "Check GitHub for new releases once a day";
+                enabled: App.updates-supported;
+                checked <=> App.auto-update;
+                toggled(on) => {
+                    App.auto-update-toggled(on);
+                }
+            }
+            SettingRow {
+                title: "Check for updates";
+                description: App.update-status;
+                enabled: App.updates-supported;
+                Button {
+                    text: "Check now";
+                    enabled: App.updates-supported && !App.update-busy;
+                    clicked => {
+                        App.check-updates();
+                    }
+                }
+            }
+            if App.update-available: InfoBar {
+                title: "WinPods " + App.update-version + " is available";
+                message: App.update-can-install ? "Downloads, verifies the signature and restarts WinPods. Streaming resumes automatically." : "Download the new version from the release page.";
+                Button {
+                    text: "Skip this version";
+                    enabled: !App.update-busy;
+                    clicked => {
+                        App.skip-update();
+                    }
+                }
+                Button {
+                    text: App.update-can-install ? "Install & restart" : "Open release page";
+                    primary: true;
+                    enabled: !App.update-busy;
+                    clicked => {
+                        App.install-update();
+                    }
+                }
+            }
+
+            // ---------------------------------------------------------------- Advanced
+            SectionTitle {
+                text: "Advanced";
+            }
+            SettingRow {
+                title: "Clock";
+                description: "PTP for HomePods, NTP for older speakers";
+                ComboBox {
+                    width: 120px;
+                    model: ["PTP", "NTP"];
+                    current-index <=> App.clock-index;
+                    accessible-label: "Clock protocol";
+                    selected => {
+                        App.clock-selected(self.current-index);
+                    }
+                }
+            }
+            SettingRow {
+                title: "Codec";
+                description: "HomePods expect ALAC";
+                ComboBox {
+                    width: 120px;
+                    model: ["ALAC", "PCM"];
+                    current-index <=> App.codec-index;
+                    accessible-label: "Audio codec";
+                    selected => {
+                        App.codec-selected(self.current-index);
+                    }
+                }
+            }
+            SettingRow {
+                title: "Renderer";
+                description: "Software fixes a blank window (after restart)";
+                ComboBox {
+                    width: 120px;
+                    model: ["Automatic", "Software"];
+                    current-index <=> App.renderer-index;
+                    accessible-label: "Renderer";
+                    selected => {
+                        App.renderer-selected(self.current-index);
+                    }
+                }
+            }
+            SettingRow {
+                title: "Log level";
+                description: "Applies after a restart";
+                ComboBox {
+                    width: 120px;
+                    model: ["Debug", "Info", "Warning", "Error"];
+                    current-index <=> App.log-level-index;
+                    accessible-label: "Log level";
+                    selected => {
+                        App.log-level-selected(self.current-index);
+                    }
+                }
+            }
+            SettingRow {
+                title: "Log files";
+                description: "winpods.log in %APPDATA%\\WinPods";
+                Button {
+                    text: "Open log folder";
+                    clicked => {
+                        App.open-log-folder();
+                    }
+                }
+            }
+
+            // ---------------------------------------------------------------- About
+            about-title := SectionTitle {
+                text: "About";
+            }
+            Card {
+                gap: 10px;
+                HorizontalLayout {
+                    spacing: 14px;
+                    Image {
+                        source: @image-url("../assets/winpods-64.png");
+                        width: 40px;
+                        height: 40px;
+                        accessible-role: none;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 1px;
+                        Text {
+                            text: "WinPods";
+                            color: Theme.text;
+                            font-weight: 600;
+                        }
+                        Caption {
+                            text: "Version " + App.version + (App.demo ? " · demo mode" : "");
+                        }
+                    }
+                }
+                Caption {
+                    text: "Streams everything you hear on Windows to a HomePod over AirPlay 2 with about 100 ms of delay.";
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    Link {
+                        text: "github.com/sheepy928/WinPods";
+                        clicked => {
+                            App.open-url("https://github.com/sheepy928/WinPods");
+                        }
+                    }
+                }
+                Caption {
+                    text: "MIT License · Copyright © 2026 Ziyang Huang";
+                }
+            }
+            CardFrame {
+                height: 128px;
+                AboutSlint { }
+            }
+            SettingRow {
+                title: "Third-party licenses";
+                description: "Open-source components used by WinPods";
+                Button {
+                    text: root.show-licenses ? "Hide" : "Show";
+                    clicked => {
+                        root.show-licenses = !root.show-licenses;
+                    }
+                }
+            }
+            if root.show-licenses: TextEdit {
+                height: 220px;
+                read-only: true;
+                wrap: word-wrap;
+                font-size: 12px;
+                text: App.licenses-text;
+                accessible-label: "Third-party licenses";
+            }
+        }
+    }
+
+    find-popup := PopupWindow {
+        x: max(12px, min(root.width - self.width - 12px, find-button.absolute-position.x + find-button.width - self.width));
+        y: find-button.absolute-position.y + find-button.height + 6px;
+        width: min(340px, root.width - 24px);
+        close-policy: close-on-click-outside;
+        Rectangle {
+            background: Theme.card-bg;
+            border-radius: Theme.radius;
+            border-width: 1px;
+            border-color: Theme.dark ? #3a3a3a : #d8d8d8;
+            drop-shadow-blur: 18px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: Theme.dark ? #00000080 : #00000030;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 8px;
+                Text {
+                    text: "AirPlay speakers";
+                    color: Theme.text;
+                    font-weight: 600;
+                }
+                if App.scan-running: HorizontalLayout {
+                    spacing: 10px;
+                    alignment: start;
+                    Spinner {
+                        indeterminate: true;
+                        width: 18px;
+                        height: 18px;
+                    }
+                    Caption {
+                        text: App.scan-message;
+                        vertical-alignment: center;
+                    }
+                }
+                if !App.scan-running && App.scan-message != "": Caption {
+                    text: App.scan-message;
+                }
+                for row[index] in App.scan-results: Rectangle {
+                    height: 48px;
+                    border-radius: Theme.control-radius;
+                    background: row-touch.pressed ? Theme.subtle-fill : row-touch.has-hover ? Theme.subtle-fill-hover : transparent;
+                    accessible-role: button;
+                    accessible-label: row.name;
+                    accessible-action-default => {
+                        App.scan-result-chosen(index);
+                        find-popup.close();
+                    }
+                    VerticalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        alignment: center;
+                        spacing: 1px;
+                        Text {
+                            text: row.name;
+                            color: Theme.text;
+                            overflow: elide;
+                        }
+                        Caption {
+                            text: row.detail;
+                            wrap: no-wrap;
+                            overflow: elide;
+                        }
+                    }
+                    row-touch := TouchArea {
+                        clicked => {
+                            App.scan-result-chosen(index);
+                            find-popup.close();
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    Button {
+                        text: "Search again";
+                        enabled: !App.scan-running;
+                        clicked => {
+                            App.find-speakers();
+                        }
+                    }
+                    Button {
+                        text: "Close";
+                        clicked => {
+                            find-popup.close();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

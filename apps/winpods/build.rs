@@ -6,6 +6,9 @@ fn main() {
     slint_build::compile_with_config("ui/app.slint", config).expect("Slint UI compiles");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        // slint-build's rerun-if-changed lines replace cargo's default "any file", so
+        // list the icon explicitly.
+        println!("cargo:rerun-if-changed=assets/winpods.ico");
         let mut res = winresource::WindowsResource::new();
         if std::path::Path::new("assets/winpods.ico").exists() {
             res.set_icon("assets/winpods.ico");
