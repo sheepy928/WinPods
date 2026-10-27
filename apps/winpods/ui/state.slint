@@ -52,8 +52,11 @@ export global App {
     in property <string> update-version;
     in property <string> update-status;
     in property <bool> update-busy;
-    // false: only "Open release page" is offered (temp copy, read-only folder, unsigned).
+    // false: only "Open release page" is offered (temp copy, read-only folder). Unsigned
+    // or badly signed releases are never offered at all.
     in property <bool> update-can-install: true;
+    // Why the last install attempt failed ("" = none); shown by both banners.
+    in property <string> update-error;
     in property <bool> updates-supported: true;
 
     // ---- settings: speaker
@@ -88,6 +91,9 @@ export global App {
 
     callback connect-toggled(bool);
     callback source-selected(int);
+    // The Source list is about to be shown: re-enumerate capture devices.
+    callback refresh-sources();
+    callback dismiss-update-error();
     callback latency-preset(int);
     callback latency-custom-edited(int);
     callback volume-enabled-toggled(bool);

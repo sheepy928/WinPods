@@ -27,6 +27,8 @@ const SHARE_READ_ONLY: u32 = 0x1;
 struct Route {
     status: u16,
     body: Vec<u8>,
+    /// `Location` header (redirects).
+    location: Option<String>,
 }
 
 #[derive(Clone)]
@@ -63,6 +65,19 @@ impl Server {
             Route {
                 status,
                 body: body.into(),
+                location: None,
+            },
+        );
+    }
+
+    /// Answer `path` with `302 Found` and `Location: location`.
+    fn redirect(&self, path: &str, location: &str) {
+        self.routes.lock().unwrap().insert(
+            path.to_string(),
+            Route {
+                status: 302,
+                body: Vec::new(),
+                location: Some(location.to_string()),
             },
         );
     }
@@ -94,14 +109,24 @@ impl Server {
         let route = route.unwrap_or(Route {
             status: 404,
             body: b"{\"message\":\"Not Found\"}".to_vec(),
+            location: None,
         });
         let mut out = stream;
+        let location = route
+            .location
+            .as_ref()
+            .map(|l| format!("Location: {l}\r\n"))
+            .unwrap_or_default();
         write!(
             out,
             "HTTP/1.1 {} {}\r\nContent-Type: application/octet-stream\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n",
+             {location}Content-Length: {}\r\nConnection: close\r\n\r\n",
             route.status,
-            if route.status == 200 { "OK" } else { "Error" },
+            match route.status {
+                200 => "OK",
+                302 => "Found",
+                _ => "Error",
+            },
             route.body.len()
         )?;
         out.write_all(&route.body)?;
@@ -143,6 +168,8 @@ struct Spec {
     served_sums: Option<String>,
     comment: Option<String>,
     signer: Option<minisign::KeyPair>,
+    /// Serve this instead of the real signature (garbage).
+    served_sig: Option<String>,
     /// Asset names to list in the API (default: all).
     assets: Option<Vec<&'static str>>,
 }
@@ -159,6 +186,7 @@ impl Spec {
             served_sums: None,
             comment: None,
             signer: None,
+            served_sig: None,
             assets: None,
         }
     }
@@ -229,6 +257,7 @@ impl Fixture {
         .unwrap()
         .into_string();
         let served_sums = spec.served_sums.clone().unwrap_or(sums);
+        let sig = spec.served_sig.clone().unwrap_or(sig);
 
         let dl = |name: &str| format!("/dl/{tag}/{name}");
         self.server.route(&dl(GUI_ASSET), 200, spec.exe.clone());
@@ -359,31 +388,191 @@ fn check_treats_missing_payload_assets_as_no_update_yet() {
     }
 }
 
-#[test]
-fn check_offers_an_unsigned_release_that_stage_refuses() {
-    // Plan §0.2: until the signing secrets exist CI publishes without the .minisig;
-    // the UI must still learn about the release to offer "open release page".
+/// `check` on a fresh fixture publishing `spec`: must find nothing, and must never
+/// download the executable.
+fn assert_not_offered(spec: Spec, what: &str) {
     let fx = Fixture::new();
+    fx.publish(spec);
+    assert_eq!(fx.updater().check(None).unwrap(), None, "{what}");
+    let exe_path = format!("/{GUI_ASSET} ");
+    assert!(
+        !fx.server
+            .requests()
+            .iter()
+            .any(|r| r.contains(&exe_path) && r.contains("/dl/")),
+        "{what}: the executable must not be downloaded"
+    );
+    assert!(fx.staged_files().is_empty(), "{what}");
+}
+
+#[test]
+fn check_never_offers_an_unsigned_or_badly_signed_release() {
+    // (a) no .minisig at all (e.g. published by hand with a stolen token)
     let mut spec = Spec::new("v0.3.0");
     spec.assets = Some(vec![GUI_ASSET, SUMS_ASSET]);
-    fx.publish(spec);
-    let updater = fx.updater();
-    let release = updater.check(None).unwrap().expect("an unsigned update");
-    assert!(!release.is_signed());
-    assert_eq!(release.version, Version::new(0, 3, 0));
+    assert_not_offered(spec, "unsigned");
 
-    let msg = expect_signature_error(updater.stage(&release, &no_progress));
-    assert!(msg.contains("unsigned"), "{msg}");
-    assert!(fx.staged_files().is_empty());
-    assert_eq!(fs::read(fx.exe()).unwrap(), OLD_EXE);
+    // (b) a garbage .minisig
+    let mut spec = Spec::new("v0.3.0");
+    spec.served_sig = Some("untrusted comment: nope\nnot a signature\n".into());
+    assert_not_offered(spec, "garbage signature");
+
+    // (c) signed with a key that is not built in
+    let mut spec = Spec::new("v0.3.0");
+    spec.signer = Some(keypair());
+    assert_not_offered(spec, "foreign key");
+
+    // (d) a valid signature for another tag / platform
+    for comment in ["WinPods v0.4.0 windows-x64", "WinPods v0.3.0 windows-arm64"] {
+        let mut spec = Spec::new("v0.3.0");
+        spec.comment = Some(comment.to_string());
+        assert_not_offered(spec, comment);
+    }
+
+    // (e) checksums swapped after signing
+    let mut spec = Spec::new("v0.3.0");
+    spec.served_sums = Some(format!("{}  {GUI_ASSET}\n", sha256_hex(b"MZ evil")));
+    assert_not_offered(spec, "tampered checksums");
+
+    // (f) correctly signed checksums that do not cover the executable
+    let mut spec = Spec::new("v0.3.0");
+    spec.sums_text = Some(format!("{}  other.zip\n", sha256_hex(b"zip")));
+    assert_not_offered(spec, "no exe entry");
+}
+
+#[test]
+fn check_verifies_the_signature_before_offering() {
+    let fx = Fixture::new();
+    let published = fx.publish(Spec::new("v0.3.0"));
+    let found = fx.updater().check(None).unwrap().expect("a signed update");
+    assert_eq!(found, published);
+    assert!(found.is_signed());
+    let requests = fx.server.requests();
+    for name in [SUMS_ASSET, SIG_ASSET] {
+        let path = format!("GET /dl/v0.3.0/{name} ");
+        assert!(
+            requests.iter().any(|r| r.starts_with(&path)),
+            "{name} fetched: {requests:?}"
+        );
+    }
+    // Nothing big is downloaded by a check.
     assert!(
-        !fx.server.requests().iter().any(|r| r.contains("/dl/")),
-        "nothing is downloaded for an unsigned release"
+        !requests
+            .iter()
+            .any(|r| r.starts_with(&format!("GET /dl/v0.3.0/{GUI_ASSET} ")))
+    );
+}
+
+#[test]
+fn check_reports_network_errors_while_verifying() {
+    // A signature that cannot be fetched is a network error (retried with backoff),
+    // not "no update" and never an unverified offer.
+    let fx = Fixture::new();
+    fx.publish(Spec::new("v0.3.0"));
+    fx.server
+        .route("/dl/v0.3.0/SHA256SUMS.txt.minisig", 500, "boom");
+    assert!(matches!(
+        fx.updater().check(None),
+        Err(UpdateError::Network(_))
+    ));
+}
+
+#[test]
+fn asset_urls_outside_github_are_refused_without_a_request() {
+    let fx = Fixture::new();
+    let mut release = fx.publish(Spec::new("v0.3.0"));
+    for asset in &mut release.assets {
+        asset.url = format!("https://downloads.example.invalid/{}", asset.name);
+    }
+    let result = fx.updater().stage(&release, &no_progress);
+    assert!(
+        matches!(&result, Err(UpdateError::Network(msg)) if msg.contains("outside GitHub")),
+        "{result:?}"
+    );
+    assert!(fx.staged_files().is_empty());
+}
+
+#[test]
+fn redirects_are_followed_and_every_hop_is_checked() {
+    let fx = Fixture::new();
+    let release = fx.publish(Spec::new("v0.3.0"));
+    let updater = fx.updater();
+
+    // Download URL → CDN (here: another loopback path) is followed.
+    let real_exe = new_exe_bytes();
+    fx.server.route("/cdn/exe", 200, real_exe.clone());
+    fx.server
+        .redirect(&format!("/dl/v0.3.0/{GUI_ASSET}"), "/cdn/exe");
+    let staged = updater.stage(&release, &no_progress).unwrap();
+    assert_eq!(fs::read(&staged.files[0].0).unwrap(), real_exe);
+    cleanup_leftovers(&[fx.exe()], Duration::from_secs(1));
+
+    // A redirect off GitHub is refused before anything is requested from it.
+    fx.server.redirect(
+        &format!("/dl/v0.3.0/{SIG_ASSET}"),
+        "https://mirror.example.invalid/SHA256SUMS.txt.minisig",
+    );
+    let err = updater.check(None).unwrap_err();
+    assert!(
+        matches!(&err, UpdateError::Network(msg) if msg.contains("outside GitHub")),
+        "{err:?}"
     );
 
-    // A complete release reports its signature asset.
-    let signed = fx.publish(Spec::new("v0.3.0"));
-    assert!(signed.is_signed());
+    // An endless redirect loop ends.
+    fx.server.redirect("/loop", "/loop");
+    let err = updater.fetch_small(&fx.server.url("/loop")).unwrap_err();
+    assert!(matches!(&err, UpdateError::Network(msg) if msg.contains("redirects")));
+}
+
+#[test]
+fn url_allowlist() {
+    for ok in [
+        "https://api.github.com/repos/sheepy928/WinPods/releases/latest",
+        "https://github.com/sheepy928/WinPods/releases/download/v0.3.0/WinPods.exe",
+        "https://objects.githubusercontent.com/github-production-release-asset/1?x=y",
+        "https://release-assets.githubusercontent.com/github-production-release-asset/1",
+        "https://GitHub.com/a/b",
+    ] {
+        assert!(url_allowed(ok, false), "{ok}");
+    }
+    for bad in [
+        "http://github.com/a/b",
+        "https://github.com.evil.example/a",
+        "https://evil.example/github.com/a",
+        "https://user@github.com/a",
+        "https://github.com:8443/a",
+        "https://github.com\\@evil.example/a",
+        "https://raw.githubusercontent.com/a/b",
+        "ftp://github.com/a",
+        "file:///C:/evil.exe",
+        "http://127.0.0.1:8080/x",
+    ] {
+        assert!(!url_allowed(bad, false), "{bad}");
+    }
+    // Test mode adds plain HTTP to loopback only.
+    assert!(url_allowed("http://127.0.0.1:8080/x", true));
+    assert!(url_allowed("http://[::1]:80/x", true));
+    assert!(!url_allowed("http://example.invalid/x", true));
+    assert!(!url_allowed("http://user@127.0.0.1/x", true));
+    assert!(!url_allowed("https://example.invalid/x", true));
+}
+
+#[test]
+fn redirect_locations_resolve() {
+    let base = "https://github.com/o/r/releases/download/v1/WinPods.exe";
+    assert_eq!(
+        resolve_location(base, "https://objects.githubusercontent.com/x?y=1").as_deref(),
+        Some("https://objects.githubusercontent.com/x?y=1")
+    );
+    assert_eq!(
+        resolve_location(base, "/o/r/other").as_deref(),
+        Some("https://github.com/o/r/other")
+    );
+    assert_eq!(
+        resolve_location(base, "//release-assets.githubusercontent.com/a").as_deref(),
+        Some("https://release-assets.githubusercontent.com/a")
+    );
+    assert_eq!(resolve_location(base, "relative/path"), None);
 }
 
 #[test]
@@ -730,7 +919,36 @@ fn swap_fails_cleanly_when_the_target_is_locked() {
 }
 
 #[test]
-fn swap_rolls_back_when_the_staged_file_is_locked() {
+fn swap_waits_for_the_staged_file_before_touching_the_exe() {
+    // Antivirus still scanning the fresh .new: the running exe must stay in place
+    // during the whole wait, and the two renames then run back to back.
+    let dir = tempfile::tempdir().unwrap();
+    let (staged, target) = staged_pair(dir.path(), GUI_ASSET, b"old", b"new");
+    let hold = OpenOptions::new()
+        .read(true)
+        .share_mode(SHARE_READ_ONLY)
+        .open(&staged)
+        .unwrap();
+    let swapper = {
+        let (staged, target) = (staged.clone(), target.clone());
+        std::thread::spawn(move || swap_files(&[(staged, target)], Duration::from_secs(10)))
+    };
+    let old = win::with_suffix(&target, ".old");
+    let until = std::time::Instant::now() + Duration::from_millis(400);
+    while std::time::Instant::now() < until {
+        assert_eq!(fs::read(&target).unwrap(), b"old", "exe renamed too early");
+        assert!(!old.exists(), "exe renamed too early");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(hold);
+    swapper.join().unwrap().unwrap();
+    assert_eq!(fs::read(&target).unwrap(), b"new");
+    assert_eq!(fs::read(&old).unwrap(), b"old");
+    assert!(!staged.exists());
+}
+
+#[test]
+fn swap_never_renames_the_exe_while_the_staged_file_stays_locked() {
     let dir = tempfile::tempdir().unwrap();
     let (staged, target) = staged_pair(dir.path(), GUI_ASSET, b"old", b"new");
     let _hold = OpenOptions::new()
@@ -742,9 +960,12 @@ fn swap_rolls_back_when_the_staged_file_is_locked() {
         &[(staged.clone(), target.clone())],
         Duration::from_millis(300),
     );
-    assert!(matches!(err, Err(UpdateError::Swap(_))));
-    // exe → exe.old happened, then was renamed back
+    assert!(
+        matches!(&err, Err(UpdateError::Swap(msg)) if msg.contains("still in use")),
+        "{err:?}"
+    );
     assert_eq!(fs::read(&target).unwrap(), b"old");
+    assert_eq!(fs::read(&staged).unwrap(), b"new");
     assert!(!win::with_suffix(&target, ".old").exists());
 }
 
@@ -889,15 +1110,31 @@ fn drafts_and_prereleases_are_never_offered() {
 }
 
 #[test]
-fn release_json_sanitises_the_page_url() {
-    let json = br#"{"tag_name":"v1.2.3","html_url":"file:///C:/evil","body":null,"assets":[]}"#;
-    let parsed = parse_release(json, REPO).unwrap();
-    assert_eq!(
-        parsed.release.html_url,
-        format!("https://github.com/{REPO}/releases/latest")
-    );
-    assert_eq!(parsed.release.notes, "");
+fn release_page_url_is_built_locally() {
+    // Whatever the (unsigned) API says, the page opened in the browser is GitHub's.
+    for html_url in [
+        "file:///C:/evil",
+        "https://github.com/attacker/WinPods/releases/tag/v1.2.3",
+        "https://github.com.evil.example/x",
+    ] {
+        let json = serde_json::json!({
+            "tag_name": "v1.2.3",
+            "html_url": html_url,
+            "body": null,
+            "assets": [],
+        });
+        let parsed = parse_release(&serde_json::to_vec(&json).unwrap(), REPO).unwrap();
+        assert_eq!(
+            parsed.release.html_url,
+            format!("https://github.com/{REPO}/releases/tag/v1.2.3")
+        );
+        assert_eq!(parsed.release.notes, "");
+    }
     assert!(parse_release(br#"{"tag_name":"nightly"}"#, REPO).is_err());
+    assert_eq!(
+        release_page_url(" a/b ", " v0.3.0 "),
+        "https://github.com/a/b/releases/tag/v0.3.0"
+    );
 }
 
 #[test]

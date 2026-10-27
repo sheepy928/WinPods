@@ -1,10 +1,12 @@
 // Main page: speaker card with the Connect switch and level meter, audio source,
 // latency, volume and a compact stats line.
 
-import { Button, ComboBox, ScrollView, Slider, SpinBox, Switch } from "std-widgets.slint";
+import { Button, ScrollView, Slider, Switch } from "std-widgets.slint";
 import { App, StatusKind } from "state.slint";
 import { Theme, Icons } from "theme.slint";
 import { Card, Caption, IconButton, InfoBar, LevelMeter, Segmented, SpeakerTile, StatusPill } from "controls.slint";
+import { OpenAwareComboBox } from "open-aware-combo-box.slint";
+import { WheelSafeSpinBox } from "wheel-safe-spinbox.slint";
 
 export component MainPage inherits Rectangle {
     // Index of the latency segment (5 = Custom).
@@ -30,7 +32,12 @@ export component MainPage inherits Rectangle {
         return 5;
     }
 
-    ScrollView {
+    // Scroll the page by a wheel delta (used where a control must not take the wheel).
+    function scroll-page(delta: length) {
+        scroller.content-y = max(min(0px, scroller.visible-height - scroller.content-height), min(0px, scroller.content-y + delta));
+    }
+
+    scroller := ScrollView {
         horizontal-scrollbar-policy: always-off;
         VerticalLayout {
             padding-left: Theme.page-padding;
@@ -69,15 +76,22 @@ export component MainPage inherits Rectangle {
                 }
             }
 
-            if App.update-available: InfoBar {
-                title: "WinPods " + App.update-version + " is available";
-                message: App.update-busy ? App.update-status : App.update-can-install ? "Installs in a few seconds; streaming resumes on its own." : "Download it from the release page.";
-                Button {
+            // Also shown after a failed install (update-error), until the next check.
+            if App.update-available || App.update-error != "": InfoBar {
+                title: App.update-available ? "WinPods " + App.update-version + " is available" : "WinPods update";
+                message: App.update-busy ? App.update-status : App.update-error != "" ? (App.update-available ? App.update-error + (App.update-can-install ? " Try again." : " Download it from the release page.") : App.update-error) : App.update-can-install ? (App.connect-on ? "Installs in a few seconds; streaming resumes on its own." : "Installs in a few seconds and restarts WinPods.") : "Download it from the release page.";
+                if App.update-available: Button {
                     text: App.update-can-install ? "Install & restart" : "Open release page";
                     primary: true;
                     enabled: !App.update-busy;
                     clicked => {
                         App.install-update();
+                    }
+                }
+                if !App.update-available: Button {
+                    text: "Dismiss";
+                    clicked => {
+                        App.dismiss-update-error();
                     }
                 }
             }
@@ -172,10 +186,16 @@ export component MainPage inherits Rectangle {
                     color: Theme.text;
                     font-weight: 600;
                 }
-                ComboBox {
+                OpenAwareComboBox {
                     model: App.sources;
                     current-index <=> App.source-index;
                     accessible-label: "Audio source";
+                    // Each opening of the list (click, Return, screen reader)
+                    // re-enumerates devices, so newly plugged-in ones show up; the
+                    // list updates in place while it is open.
+                    opened => {
+                        App.refresh-sources();
+                    }
                     selected => {
                         App.source-selected(self.current-index);
                     }
@@ -210,15 +230,20 @@ export component MainPage inherits Rectangle {
                 if App.latency-custom: HorizontalLayout {
                     spacing: 10px;
                     alignment: start;
-                    SpinBox {
+                    // Scrolling the page over it must not change the latency (each
+                    // change restarts the stream); see wheel-safe-spinbox.slint.
+                    WheelSafeSpinBox {
                         width: 132px;
                         minimum: 75;
                         maximum: 5000;
                         step-size: 5;
                         value <=> App.latency-ms;
-                        accessible-label: "Custom latency in milliseconds";
+                        label: "Custom latency in milliseconds";
                         edited(value) => {
                             App.latency-custom-edited(value);
+                        }
+                        scroll-page(delta) => {
+                            root.scroll-page(delta);
                         }
                     }
                     Text {

@@ -1,0 +1,106 @@
+// A SpinBox the mouse wheel does not change by accident while the page scrolls.
+//
+// The plain SpinBox changes its value on every wheel tick over it, focused or not,
+// and keeps keyboard focus after Enter or an arrow click. On the main page the value
+// is the custom latency (each change restarts the stream), so scrolling the page past
+// the box must not touch it. Here the wheel changes the value only while the box is
+// "armed", and scrolls the page (`scroll-page`) otherwise:
+// * a click on the box gives it focus and arms it (a click on an arrow also steps the
+//   value, so the first click is not lost);
+// * leaving the box with the pointer, Enter, Escape or losing focus disarms it.
+// Typing works whenever the box has focus, armed or not.
+
+import { SpinBox } from "std-widgets.slint";
+
+export component WheelSafeSpinBox inherits Rectangle {
+    in property <int> minimum;
+    in property <int> maximum: 100;
+    in property <int> step-size: 1;
+    in property <string> label;
+    in-out property <int> value;
+    out property <bool> has-focus: spin.has-focus;
+    // True while the wheel changes the value (see above).
+    out property <bool> armed: false;
+
+    callback edited(value: int);
+    // A wheel delta over the box that belongs to the page.
+    callback scroll-page(delta: length);
+
+    height: spin.min-height;
+
+    // Width of the fluent SpinBox's arrow buttons (2 x 28px, 4px apart, 2px padding),
+    // and of the down arrow alone.
+    property <length> arrows-width: 64px;
+    property <length> down-arrow-width: 32px;
+
+    function step(delta: int) {
+        // Same rule as SpinBox's own arrows: a step outside the range does nothing.
+        if root.value + delta >= root.minimum && root.value + delta <= root.maximum {
+            root.value = root.value + delta;
+            root.edited(root.value);
+        }
+    }
+
+    // Parent of everything else, so it sees each pointer event on its way in and its
+    // has-hover is true exactly while the pointer is over the box.
+    hover := TouchArea {
+        width: parent.width;
+        height: parent.height;
+
+        changed has-hover => {
+            if !self.has-hover {
+                root.armed = false;
+            }
+        }
+
+        FocusScope {
+            width: parent.width;
+            height: parent.height;
+            // Never takes focus itself; it only sees the keys on their way to the box.
+            enabled: false;
+            capture-key-pressed(event) => {
+                if event.text == Key.Return || event.text == Key.Escape {
+                    root.armed = false;
+                }
+                reject
+            }
+
+            spin := SpinBox {
+                width: parent.width;
+                height: parent.height;
+                minimum: root.minimum;
+                maximum: root.maximum;
+                step-size: root.step-size;
+                value <=> root.value;
+                accessible-label: root.label;
+                edited(value) => {
+                    root.edited(value);
+                }
+                changed has-focus => {
+                    if !self.has-focus {
+                        root.armed = false;
+                    }
+                }
+            }
+        }
+
+        // On top of the SpinBox until it is armed: takes the wheel for the page, and
+        // turns the first click into focus (plus the arrow step it was aimed at).
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+            enabled: !(root.armed && spin.has-focus && hover.has-hover);
+            clicked => {
+                spin.focus();
+                root.armed = true;
+                if self.pressed-x >= self.width - root.arrows-width {
+                    root.step(self.pressed-x >= self.width - root.down-arrow-width ? -root.step-size : root.step-size);
+                }
+            }
+            scroll-event(event) => {
+                root.scroll-page(event.delta-y);
+                accept
+            }
+        }
+    }
+}

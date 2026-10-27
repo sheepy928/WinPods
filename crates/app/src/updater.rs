@@ -2,26 +2,30 @@
 //!
 //! * One ureq Agent: https_only, connect 10 s, per-read 30 s, global 20 s for API
 //!   calls (downloads use per-read + a generous body timeout), User-Agent
-//!   `WinPods/<version>`.
+//!   `WinPods/<version>`. Requests only go to GitHub (`github.com`, `api.github.com`,
+//!   `objects.githubusercontent.com`, `release-assets.githubusercontent.com`, HTTPS
+//!   only); redirects are followed by hand so every hop is checked against that list.
 //! * `check`: GET `https://api.github.com/repos/<repo>/releases/latest` (Accept
 //!   `application/vnd.github+json`, X-GitHub-Api-Version). Newer semver tag than the
-//!   running version and not skipped → `Some(Release)`. Missing assets → `None`:
-//!   a release without `WinPods.exe` or `SHA256SUMS.txt` is "no update yet". A
-//!   missing `SHA256SUMS.txt.minisig` does not hide the release (plan §0.2: CI
-//!   publishes unsigned releases until the signing secrets exist); it is returned
-//!   with [`Release::is_signed`] false so the UI can offer "open release page".
-//! * `stage`: download `SHA256SUMS.txt` and `SHA256SUMS.txt.minisig` (≤ 1 MB), verify
-//!   with one of `update_key::UPDATE_PUBLIC_KEYS`; the trusted comment must be
+//!   running version and not skipped → download `SHA256SUMS.txt` and
+//!   `SHA256SUMS.txt.minisig` and verify them (see `stage`); only a release whose
+//!   checksums verify is returned. Missing assets → `None`: a release without
+//!   `WinPods.exe` or `SHA256SUMS.txt` is "no update yet", and an unsigned release, a
+//!   bad signature or a wrong trusted comment is never offered (logged, `None`).
+//! * `stage`: download `SHA256SUMS.txt` and `SHA256SUMS.txt.minisig` (≤ 1 MB) again,
+//!   verify with one of `update_key::UPDATE_PUBLIC_KEYS`; the trusted comment must be
 //!   `WinPods <tag> windows-x64` and the tag newer than the running version (blocks
 //!   downgrades). Then stream `WinPods.exe` (and `winpods-cli.exe` if it sits next to
 //!   the exe) to `<name>.new`, hashing while downloading; size must equal the API size
 //!   and SHA-256 must match the SHA256SUMS line. No signature (missing, invalid, or
-//!   no built-in key) → [`UpdateError::Signature`] (UI then only offers "open
-//!   release page").
-//! * `install`: rename swap while still running: `exe → exe.old`, `exe.new → exe`
-//!   (retry ~10 s on sharing violations); on failure rename back and keep running.
+//!   no built-in key) → [`UpdateError::Signature`].
+//! * `install`: rename swap while still running. Per file: wait (~10 s) until nobody
+//!   else has the `.new` file open, then `exe → exe.old` and `exe.new → exe` back to
+//!   back (retrying sharing violations); on failure rename back and keep running.
 //!   The caller then hands off (`WinPods.exe --post-update <pid>`) and exits.
 //! * `finish_post_update`: delete leftover `.old`/`.new` files.
+//! * The release page is always `https://github.com/<repo>/releases/tag/<tag>`, built
+//!   here (never taken from the API JSON).
 //! * `WINPODS_UPDATE_REPO` overrides the repository (testing).
 //!
 //! Security notes: TLS (rustls, webpki roots) authenticates GitHub, but the
@@ -32,7 +36,7 @@
 //! the exe and swapped in after both size and SHA-256 matched.
 
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -68,9 +72,22 @@ const DOWNLOAD_BODY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const SWAP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long `finish_post_update` waits for the previous process to let go of `.old`.
 const POST_UPDATE_WAIT: Duration = Duration::from_secs(5);
+/// How long creating a `.new` file is retried while something else holds it.
+const CREATE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_API_BYTES: u64 = 4 << 20;
 const MAX_SMALL_ASSET_BYTES: u64 = 1 << 20;
 const MAX_EXE_BYTES: u64 = 512 << 20;
+/// Redirects followed per request (GitHub needs one: download URL → CDN).
+const MAX_REDIRECTS: usize = 5;
+
+/// The only hosts update requests (and their redirects) may go to, over HTTPS: the
+/// API, release download URLs and the CDNs those redirect to.
+pub const ALLOWED_HOSTS: &[&str] = &[
+    "github.com",
+    "api.github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Release {
@@ -83,9 +100,8 @@ pub struct Release {
 }
 
 impl Release {
-    /// True when the release carries [`SIG_ASSET`]. Whether that signature verifies is
-    /// only known after [`Updater::stage`]; an unsigned release can only be offered as
-    /// "open release page".
+    /// True when the release carries [`SIG_ASSET`]. Every release [`Updater::check`]
+    /// returns does (and its signature verified); [`Updater::stage`] verifies again.
     pub fn is_signed(&self) -> bool {
         find_asset(self, SIG_ASSET).is_some()
     }
@@ -129,8 +145,9 @@ pub enum UpdateError {
 pub struct UpdaterOptions {
     /// API base URL (default [`GITHUB_API`]).
     pub api_base: String,
-    /// Allow plain `http://` URLs, but only to loopback hosts (local test servers).
-    /// Also disables proxies so loopback requests stay local.
+    /// Also allow plain `http://` URLs to loopback hosts (local test servers); HTTPS
+    /// URLs are still limited to [`ALLOWED_HOSTS`]. Also disables proxies so loopback
+    /// requests stay local.
     pub allow_http_loopback: bool,
     /// Trusted minisign public keys (base64; default [`update_key::UPDATE_PUBLIC_KEYS`]).
     pub public_keys: Vec<String>,
@@ -176,6 +193,8 @@ impl Updater {
             .https_only(!opts.allow_http_loopback)
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_per_read(Some(READ_TIMEOUT))
+            // Redirects are followed in `get`, which checks every hop's host.
+            .max_redirects(0)
             .user_agent(format!("WinPods/{current}"));
         if opts.allow_http_loopback {
             config = config.proxy(None);
@@ -193,7 +212,10 @@ impl Updater {
         repo_from(std::env::var(REPO_ENV).ok())
     }
 
-    /// Newest release if it is newer than the running version and not `skipped`.
+    /// Newest release if it is newer than the running version, not `skipped`, and its
+    /// `SHA256SUMS.txt` carries a valid signature from a built-in key (trusted comment
+    /// `WinPods <tag> windows-x64`). An unsigned or badly signed release is logged and
+    /// reported as `Ok(None)`: it is never offered, not even as a release page.
     pub fn check(&self, skipped: Option<&str>) -> Result<Option<Release>, UpdateError> {
         if !is_valid_repo(&self.repo) {
             return Err(UpdateError::Other(format!(
@@ -206,23 +228,21 @@ impl Updater {
             self.opts.api_base.trim_end_matches('/'),
             self.repo
         );
-        self.ensure_allowed_url(&url)?;
-        let response = self
-            .agent
-            .get(&url)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .config()
-            .timeout_global(Some(API_TIMEOUT))
-            .build()
-            .call();
+        let response = self.get(
+            &url,
+            &[
+                ("Accept", "application/vnd.github+json"),
+                ("X-GitHub-Api-Version", "2022-11-28"),
+            ],
+            Budget::Api,
+        );
         let mut response = match response {
             Ok(response) => response,
-            Err(ureq::Error::StatusCode(404)) => {
+            Err(GetError::Http(ureq::Error::StatusCode(404))) => {
                 tracing::info!("update check: {} has no published release", self.repo);
                 return Ok(None);
             }
-            Err(e) => return Err(network(e)),
+            Err(e) => return Err(e.into()),
         };
         let body = response
             .body_mut()
@@ -231,7 +251,67 @@ impl Updater {
             .read_to_vec()
             .map_err(network)?;
         let parsed = parse_release(&body, &self.repo)?;
-        Ok(evaluate(parsed, &self.current, skipped))
+        let Some(release) = evaluate(parsed, &self.current, skipped) else {
+            return Ok(None);
+        };
+        Ok(self.signed_checksums_verify(&release)?.then_some(release))
+    }
+
+    /// Download the release's `SHA256SUMS.txt` and its signature and check them before
+    /// the release is offered. `Ok(false)` (logged) when the signature is missing or
+    /// does not verify, or the signed checksums lack the executable; network errors
+    /// are returned so the caller backs off and retries.
+    fn signed_checksums_verify(&self, release: &Release) -> Result<bool, UpdateError> {
+        let Some(sig_asset) = find_asset(release, SIG_ASSET) else {
+            tracing::warn!(
+                "update check: {} has no {SIG_ASSET}; an unsigned release is not offered",
+                release.tag
+            );
+            return Ok(false);
+        };
+        let Some(sums_asset) = find_asset(release, SUMS_ASSET) else {
+            return Ok(false);
+        };
+        let sums = self.fetch_small(&sums_asset.url)?;
+        let sig = self.fetch_small(&sig_asset.url)?;
+        let verified = String::from_utf8(sig)
+            .map_err(|_| UpdateError::Signature(format!("{SIG_ASSET} is not text")))
+            .and_then(|sig| {
+                verify_signature(
+                    &sums,
+                    &sig,
+                    &self.opts.public_keys,
+                    &release.tag,
+                    &self.current,
+                )
+            });
+        match verified {
+            Ok(()) => {}
+            Err(UpdateError::Signature(msg)) => {
+                tracing::error!(
+                    "update check: {} is not offered, its signature does not verify: {msg}",
+                    release.tag
+                );
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        }
+        let has_exe = std::str::from_utf8(&sums)
+            .ok()
+            .and_then(|text| parse_sha256sums(text).ok())
+            .is_some_and(|table| table.contains_key(GUI_ASSET));
+        if !has_exe {
+            tracing::warn!(
+                "update check: the signed {SUMS_ASSET} of {} has no {GUI_ASSET} entry",
+                release.tag
+            );
+            return Ok(false);
+        }
+        tracing::info!(
+            "update check: {} is available (signature verified)",
+            release.tag
+        );
+        Ok(true)
     }
 
     /// Download and verify (signature, size, hash) next to the running exe.
@@ -253,8 +333,9 @@ impl Updater {
             )));
         }
 
-        // 1. Signed checksums. An unsigned release is a signature error first, whatever
-        //    else it lacks, so the UI falls back to "open release page".
+        // 1. Signed checksums, verified again: the assets may have changed since
+        //    `check`, and the hashes below must come from verified data. An unsigned
+        //    release is a signature error first, whatever else it lacks.
         let sig_asset = find_asset(release, SIG_ASSET).ok_or_else(|| {
             UpdateError::Signature(format!("the release has no {SIG_ASSET} (unsigned)"))
         })?;
@@ -376,34 +457,69 @@ impl Updater {
         Ok((exe, dir))
     }
 
-    /// Only `https://` URLs, or `http://` to a loopback host in test mode.
+    /// Only `https://` URLs on [`ALLOWED_HOSTS`], or `http://` to a loopback host in
+    /// test mode.
     fn ensure_allowed_url(&self, url: &str) -> Result<(), UpdateError> {
-        if url.starts_with("https://") {
-            return Ok(());
+        if url_allowed(url, self.opts.allow_http_loopback) {
+            Ok(())
+        } else {
+            Err(UpdateError::Network(format!(
+                "refusing a URL outside GitHub (HTTPS only): {url}"
+            )))
         }
-        if self.opts.allow_http_loopback
-            && let Some(rest) = url.strip_prefix("http://")
-            && is_loopback_authority(rest.split('/').next().unwrap_or(""))
-        {
-            return Ok(());
+    }
+
+    /// GET `url`, following up to [`MAX_REDIRECTS`] redirects by hand so that every
+    /// hop (not just the first URL) must pass [`Updater::ensure_allowed_url`].
+    fn get(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        budget: Budget,
+    ) -> Result<ureq::http::Response<ureq::Body>, GetError> {
+        let mut current = url.to_string();
+        for _ in 0..=MAX_REDIRECTS {
+            self.ensure_allowed_url(&current)
+                .map_err(GetError::Refused)?;
+            let mut request = self.agent.get(&current);
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            let request = match budget {
+                Budget::Api => request.config().timeout_global(Some(API_TIMEOUT)).build(),
+                Budget::Download => request
+                    .config()
+                    .timeout_recv_body(Some(DOWNLOAD_BODY_TIMEOUT))
+                    .build(),
+            };
+            let response = request.call().map_err(GetError::Http)?;
+            if !response.status().is_redirection() {
+                return Ok(response);
+            }
+            let location = response
+                .headers()
+                .get(ureq::http::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| {
+                    GetError::Refused(UpdateError::Network(format!(
+                        "{current}: redirect ({}) without a usable Location",
+                        response.status()
+                    )))
+                })?;
+            current = resolve_location(&current, location).ok_or_else(|| {
+                GetError::Refused(UpdateError::Network(format!(
+                    "{current}: unsupported redirect target {location:?}"
+                )))
+            })?;
         }
-        Err(UpdateError::Network(format!(
-            "refusing a non-HTTPS URL: {url}"
-        )))
+        Err(GetError::Refused(UpdateError::Network(format!(
+            "{url}: more than {MAX_REDIRECTS} redirects"
+        ))))
     }
 
     /// GET a small asset (checksums, signature) into memory.
     fn fetch_small(&self, url: &str) -> Result<Vec<u8>, UpdateError> {
-        self.ensure_allowed_url(url)?;
-        let mut response = self
-            .agent
-            .get(url)
-            .header("Accept", "application/octet-stream")
-            .config()
-            .timeout_global(Some(API_TIMEOUT))
-            .build()
-            .call()
-            .map_err(network)?;
+        let mut response = self.get(url, &[("Accept", "application/octet-stream")], Budget::Api)?;
         response
             .body_mut()
             .with_config()
@@ -422,16 +538,11 @@ impl Updater {
     ) -> Result<(), UpdateError> {
         let name = &item.asset.name;
         let expected = item.asset.size;
-        self.ensure_allowed_url(&item.asset.url)?;
-        let response = self
-            .agent
-            .get(&item.asset.url)
-            .header("Accept", "application/octet-stream")
-            .config()
-            .timeout_recv_body(Some(DOWNLOAD_BODY_TIMEOUT))
-            .build()
-            .call()
-            .map_err(network)?;
+        let response = self.get(
+            &item.asset.url,
+            &[("Accept", "application/octet-stream")],
+            Budget::Download,
+        )?;
         if let Some(len) = response.body().content_length()
             && len != expected
         {
@@ -440,8 +551,11 @@ impl Updater {
             )));
         }
         let mut reader = response.into_body().into_reader();
-        let mut file = File::create(&item.staged)
-            .map_err(|e| UpdateError::NotWritable(format!("{}: {e}", item.staged.display())))?;
+        // The folder was found writable before the download started, so a failure here
+        // is most likely transient (antivirus holding an old `.new`): a retryable error,
+        // not `NotWritable` (which makes the UI give up on installing in place).
+        let mut file = win::retry_sharing(CREATE_TIMEOUT, || File::create(&item.staged))
+            .map_err(|e| UpdateError::Other(format!("{}: {e}", item.staged.display())))?;
         let mut hasher = Sha256::new();
         let mut buf = vec![0u8; 64 * 1024];
         let mut received = 0u64;
@@ -495,6 +609,83 @@ struct DownloadItem<'a> {
 
 fn network(e: ureq::Error) -> UpdateError {
     UpdateError::Network(e.to_string())
+}
+
+/// Timeout budget of one request.
+#[derive(Debug, Clone, Copy)]
+enum Budget {
+    /// API calls and small assets: [`API_TIMEOUT`] for the whole request.
+    Api,
+    /// Executables: per-read timeout plus [`DOWNLOAD_BODY_TIMEOUT`] for the body.
+    Download,
+}
+
+/// Why [`Updater::get`] failed.
+#[derive(Debug)]
+enum GetError {
+    /// A URL (or redirect target) outside the allowed hosts, or a broken redirect.
+    Refused(UpdateError),
+    /// The request itself failed (kept as is so callers can look at the status).
+    Http(ureq::Error),
+}
+
+impl From<GetError> for UpdateError {
+    fn from(e: GetError) -> Self {
+        match e {
+            GetError::Refused(e) => e,
+            GetError::Http(e) => network(e),
+        }
+    }
+}
+
+/// True when `url` is `https://<allowed host>/...` (no user info, no port), or, with
+/// `allow_http_loopback`, `http://<loopback>[:port]/...`.
+fn url_allowed(url: &str, allow_http_loopback: bool) -> bool {
+    let authority_of = |rest: &str| -> String {
+        rest.split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+    if let Some(rest) = url.strip_prefix("https://") {
+        let host = authority_of(rest);
+        return !host.contains(['@', ':', '\\'])
+            && ALLOWED_HOSTS
+                .iter()
+                .any(|allowed| host.eq_ignore_ascii_case(allowed));
+    }
+    if allow_http_loopback && let Some(rest) = url.strip_prefix("http://") {
+        let authority = authority_of(rest);
+        return !authority.contains(['@', '\\']) && is_loopback_authority(&authority);
+    }
+    false
+}
+
+/// Absolute URL of a redirect's `Location` relative to `base` (absolute URLs,
+/// scheme-relative `//host/...` and absolute paths `/...`; anything else is `None`).
+fn resolve_location(base: &str, location: &str) -> Option<String> {
+    let location = location.trim();
+    if location.starts_with("https://") || location.starts_with("http://") {
+        return Some(location.to_string());
+    }
+    let (scheme, rest) = base.split_once("://")?;
+    if let Some(path) = location.strip_prefix("//") {
+        return Some(format!("{scheme}://{path}"));
+    }
+    if location.starts_with('/') {
+        let authority = rest.split(['/', '?', '#']).next()?;
+        return Some(format!("{scheme}://{authority}{location}"));
+    }
+    None
+}
+
+/// The release page of `tag`, built locally: `https://github.com/<repo>/releases/tag/<tag>`.
+pub fn release_page_url(repo: &str, tag: &str) -> String {
+    format!(
+        "https://github.com/{}/releases/tag/{}",
+        repo.trim(),
+        tag.trim()
+    )
 }
 
 fn find_asset<'a>(release: &'a Release, name: &str) -> Option<&'a ReleaseAsset> {
@@ -555,8 +746,6 @@ pub fn parse_tag(tag: &str) -> Option<Version> {
 struct ApiRelease {
     tag_name: String,
     #[serde(default)]
-    html_url: Option<String>,
-    #[serde(default)]
     body: Option<String>,
     #[serde(default)]
     draft: bool,
@@ -581,19 +770,16 @@ struct ParsedRelease {
     prerelease: bool,
 }
 
-/// Decode the `releases/latest` JSON. `html_url` comes from unsigned API data and the
-/// UI opens it in the browser, so it is only kept when it is an HTTPS URL on
-/// github.com; otherwise the repository's releases page is used.
+/// Decode the `releases/latest` JSON. The UI opens `html_url` in the browser, so it is
+/// never taken from the (unsigned) API data: it is built from the repository and the
+/// tag, which must be a version (`https://github.com/<repo>/releases/tag/<tag>`).
 fn parse_release(json: &[u8], repo: &str) -> Result<ParsedRelease, UpdateError> {
     let api: ApiRelease = serde_json::from_slice(json)
         .map_err(|e| UpdateError::Other(format!("unexpected release JSON: {e}")))?;
     let version = parse_tag(&api.tag_name).ok_or_else(|| {
         UpdateError::Other(format!("release tag {:?} is not a version", api.tag_name))
     })?;
-    let html_url = api
-        .html_url
-        .filter(|u| u.starts_with("https://github.com/") && !u.contains(char::is_whitespace))
-        .unwrap_or_else(|| format!("https://github.com/{repo}/releases/latest"));
+    let html_url = release_page_url(repo, &api.tag_name);
     Ok(ParsedRelease {
         release: Release {
             tag: api.tag_name,
@@ -626,13 +812,12 @@ fn is_skipped(tag: &str, skipped: Option<&str>) -> bool {
     matches!((parse_tag(skipped), parse_tag(tag)), (Some(a), Some(b)) if a == b)
 }
 
-/// Offer `parsed` only when it is a final release, newer than `current`, not skipped,
-/// and carries the executable and its checksums (without them it is still uploading or
-/// not meant for in-app updates: "no update yet").
+/// A candidate when `parsed` is a final release, newer than `current`, not skipped, and
+/// carries the executable and its checksums (without them it is still uploading or not
+/// meant for in-app updates: "no update yet").
 ///
-/// A missing signature does not hide the release: it is offered as unsigned
-/// ([`Release::is_signed`] is false), the UI can only open its page, and
-/// [`Updater::stage`] refuses it with [`UpdateError::Signature`].
+/// The signature is checked afterwards by [`Updater::check`], which needs the network;
+/// a candidate without one is never offered.
 fn evaluate(parsed: ParsedRelease, current: &Version, skipped: Option<&str>) -> Option<Release> {
     let release = parsed.release;
     if parsed.draft || parsed.prerelease {
@@ -658,12 +843,6 @@ fn evaluate(parsed: ParsedRelease, current: &Version, skipped: Option<&str>) -> 
             missing.join(", ")
         );
         return None;
-    }
-    if !release.is_signed() {
-        tracing::warn!(
-            "update check: {} has no {SIG_ASSET}; only its release page can be offered",
-            release.tag
-        );
     }
     Some(release)
 }
@@ -760,8 +939,25 @@ struct Swapped<'a> {
     had_old: bool,
 }
 
+/// Open `path` with no sharing at all. This only succeeds once nobody else (antivirus,
+/// the indexer) has the file open, and keeps them out while the handle lives.
+fn open_exclusive(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+    OpenOptions::new()
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+        .share_mode(0)
+        .open(path)
+}
+
 /// `target → target.old`, `staged → target` for every pair, retrying sharing
 /// violations for `timeout`. On failure everything done so far is renamed back.
+///
+/// The wait for other programs to let go of a freshly written `.new` file happens
+/// *before* the running exe is renamed (the staged file is held exclusively while
+/// `target → target.old` runs), so the two renames run back to back and the window in
+/// which `target` does not exist is as short as possible (power loss, logoff).
 fn swap_files(files: &[(PathBuf, PathBuf)], timeout: Duration) -> Result<(), UpdateError> {
     let mut done: Vec<Swapped<'_>> = Vec::with_capacity(files.len());
     for (staged, target) in files {
@@ -790,6 +986,15 @@ fn swap_files(files: &[(PathBuf, PathBuf)], timeout: Duration) -> Result<(), Upd
                 ));
             }
         }
+        let reservation = match win::retry_sharing(timeout, || open_exclusive(staged)) {
+            Ok(file) => file,
+            Err(e) => {
+                return Err(fail(
+                    &done,
+                    format!("{} is still in use: {e}", staged.display()),
+                ));
+            }
+        };
         let had_old = target.exists();
         if had_old
             && let Err(e) = win::retry_sharing(timeout, || win::move_file(target, &old, false))
@@ -799,13 +1004,16 @@ fn swap_files(files: &[(PathBuf, PathBuf)], timeout: Duration) -> Result<(), Upd
                 format!("cannot rename {}: {e}", target.display()),
             ));
         }
+        // A rename needs every other handle to share delete access: let go right
+        // before moving the staged file in.
+        drop(reservation);
         if let Err(e) = win::retry_sharing(timeout, || win::move_file(staged, target, false)) {
             let mut what = format!("cannot move {} into place: {e}", staged.display());
             if had_old
                 && let Err(r) = win::retry_sharing(timeout, || win::move_file(&old, target, false))
             {
                 what.push_str(&format!(
-                    "; could not restore {} from {}: {r}",
+                    "; could not restore {} from {}: {r} (rename it back by hand)",
                     target.display(),
                     old.display()
                 ));
