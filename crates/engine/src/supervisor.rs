@@ -252,8 +252,8 @@ struct Stream {
 
 /// The stream counters in the log, for tray-only use and bug reports (the window
 /// shows them only while it is open): at most once per [`STATS_LOG_EVERY`] and only
-/// when silence, pauses, trims, resends or send errors went up, plus a summary when
-/// the stream ends.
+/// when pauses, trims, resends or send errors went up, plus a summary when the stream
+/// ends. Silence alone does not count: it grows for as long as nothing plays.
 struct StatsLog {
     next_at: Instant,
     logged: runtime::StreamStats,
@@ -275,7 +275,6 @@ impl StatsLog {
         self.next_at = now + STATS_LOG_EVERY;
         let notable = |s: &runtime::StreamStats| {
             (
-                s.silence_packets,
                 s.stalls,
                 s.frames_trimmed,
                 s.retransmit_requests,
@@ -1663,28 +1662,29 @@ mod tests {
             !log.due(&stats, minute),
             "packets and anchors alone are routine"
         );
-        stats.stalls = 1;
+        // Each check below comes when a line could be due, unless it says otherwise.
+        let at = |minutes: u32| minute + STATS_LOG_EVERY * minutes;
         stats.silence_packets = 40;
         assert!(
-            !log.due(&stats, minute + Duration::from_secs(1)),
+            !log.due(&stats, at(1)),
+            "silence alone is not news (it grows while nothing plays)"
+        );
+        stats.stalls = 1;
+        assert!(
+            !log.due(&stats, at(1) + Duration::from_secs(1)),
             "at most once a minute"
         );
-        assert!(
-            log.due(&stats, minute + STATS_LOG_EVERY),
-            "a pause is logged"
-        );
-        assert!(
-            !log.due(&stats, minute + 2 * STATS_LOG_EVERY),
-            "nothing new since the last line"
-        );
+        assert!(log.due(&stats, at(2)), "a pause is logged");
+        stats.silence_packets = 9000;
+        assert!(!log.due(&stats, at(3)), "nothing new but silence");
         stats.retransmit_requests = 2;
         stats.retransmitted = 2;
-        assert!(log.due(&stats, minute + 3 * STATS_LOG_EVERY));
+        assert!(log.due(&stats, at(4)), "resends are logged");
 
         stats.ring_frames = 176;
         assert_eq!(
             stats_summary(&stats, Duration::from_secs(725)),
-            "12m 5s: 7500 packets, 40 silence, 1 pauses, 0 frames trimmed, 2/2 resent, 0 send errors, ring 4 ms"
+            "12m 5s: 7500 packets, 9000 silence, 1 pauses, 0 frames trimmed, 2/2 resent, 0 send errors, ring 4 ms"
         );
     }
 
