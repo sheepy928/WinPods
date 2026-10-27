@@ -19,6 +19,11 @@
 //! still returned by [`CaptureHandle::stop`]. In steady state the loop only waits,
 //! reads packets into preallocated buffers, converts, resamples and pushes; it does
 //! not allocate, log or lock.
+//!
+//! Everything after the device is open is device-independent: a `DrainLoop` reads a
+//! `PacketSource` (the WASAPI capture client in production) through a
+//! `PacketConverter` (silent packets, discontinuities, decoding, resampling, idle
+//! flush), so the loop is unit-tested against scripted packets.
 
 use std::any::Any;
 use std::panic::{self, AssertUnwindSafe};
@@ -30,10 +35,10 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use wasapi::{
-    AudioCaptureClient, AudioClient, Device, DeviceEnumerator, Direction, SampleType, StreamMode,
-    WasapiError,
+    AudioCaptureClient, AudioClient, BufferFlags, Device, DeviceEnumerator, Direction, SampleType,
+    StreamMode, WasapiError,
 };
-use winpods_rt::{AutoEvent, Frame, HiResTimer, MmcssGuard, RingProducer, Wait, wait_any};
+use winpods_rt::{AutoEvent, Frame, HANDLE, HiResTimer, MmcssGuard, RingProducer, Wait, wait_any};
 
 use crate::convert::{SampleFormat, decode_stereo, peak};
 use crate::devices::{self, ComGuard, DeviceInfo};
@@ -99,6 +104,15 @@ struct Shared {
 }
 
 impl Shared {
+    fn new() -> windows::core::Result<Self> {
+        Ok(Self {
+            stop: AutoEvent::new()?,
+            stop_requested: AtomicBool::new(false),
+            discontinuities: AtomicU64::new(0),
+            exit: Mutex::new(None),
+        })
+    }
+
     fn request_stop(&self) {
         self.stop_requested.store(true, Ordering::Release);
         self.stop.set();
@@ -124,19 +138,13 @@ impl CaptureHandle {
         source: &CaptureSource,
         producer: RingProducer,
     ) -> Result<CaptureHandle, (CaptureError, RingProducer)> {
-        let stop = match AutoEvent::new() {
-            Ok(event) => event,
+        let shared = match Shared::new() {
+            Ok(shared) => Arc::new(shared),
             Err(e) => {
                 let error = CaptureError::Device(format!("cannot create the stop event: {e}"));
                 return Err((error, producer));
             }
         };
-        let shared = Arc::new(Shared {
-            stop,
-            stop_requested: AtomicBool::new(false),
-            discontinuities: AtomicU64::new(0),
-            exit: Mutex::new(None),
-        });
         // The producer travels through a channel after the spawn succeeded, so a
         // failed spawn cannot swallow it.
         let (producer_tx, producer_rx) = mpsc::sync_channel::<RingProducer>(1);
@@ -335,7 +343,9 @@ fn run_wasapi(
     let _ = setup.send(Ok(stream.info.clone()));
     drop(setup);
     let _mmcss = MmcssGuard::pro_audio();
-    let exit = stream.run(producer, shared);
+    let exit = stream
+        .drain
+        .run(stream.event.as_handle(), producer, shared, WAIT_TIMEOUT);
     let _ = stream.client.stop_stream();
     exit
 }
@@ -352,6 +362,7 @@ fn device_lost(error: &WasapiError) -> CaptureExit {
 }
 
 /// Why the drain loop stopped.
+#[derive(Debug)]
 enum StreamError {
     Wasapi(WasapiError),
     Resample(ResampleError),
@@ -370,6 +381,8 @@ impl From<ResampleError> for StreamError {
 }
 
 impl StreamError {
+    /// Every WASAPI error ends capture as a lost device (the engine restarts it); a
+    /// resampler error is an internal failure.
     fn into_exit(self) -> CaptureExit {
         match self {
             Self::Wasapi(e) => device_lost(&e),
@@ -378,26 +391,229 @@ impl StreamError {
     }
 }
 
-/// An open, initialised WASAPI capture stream with all buffers preallocated.
-struct Stream {
-    // Field order is drop order: the capture client before the audio client.
-    capture: AudioCaptureClient,
-    client: AudioClient,
-    event: wasapi::Handle,
-    info: CaptureInfo,
+/// The packet flags the conversion acts on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PacketFlags {
+    /// `AUDCLNT_BUFFERFLAGS_SILENT`: the packet is silence, whatever its bytes hold.
+    silent: bool,
+    /// `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`: audio was lost before this packet.
+    discontinuity: bool,
+}
+
+impl From<&BufferFlags> for PacketFlags {
+    fn from(flags: &BufferFlags) -> Self {
+        Self {
+            silent: flags.silent,
+            discontinuity: flags.data_discontinuity,
+        }
+    }
+}
+
+/// The two capture-client calls the drain loop makes. Behind a trait so the loop
+/// runs unchanged against scripted packets in tests; [`AudioCaptureClient`] is the
+/// only production implementation.
+trait PacketSource {
+    /// Frames in the next queued packet; 0 when nothing is queued.
+    fn next_packet_frames(&mut self) -> Result<usize, WasapiError>;
+    /// Copy the next packet to the front of `buffer`; returns its frame count and
+    /// flags.
+    fn read_packet(&mut self, buffer: &mut [u8]) -> Result<(usize, PacketFlags), WasapiError>;
+}
+
+impl PacketSource for AudioCaptureClient {
+    fn next_packet_frames(&mut self) -> Result<usize, WasapiError> {
+        Ok(self.get_next_packet_size()?.unwrap_or(0) as usize)
+    }
+
+    fn read_packet(&mut self, buffer: &mut [u8]) -> Result<(usize, PacketFlags), WasapiError> {
+        let (frames, info) = self.read_from_device(buffer)?;
+        Ok((frames as usize, PacketFlags::from(&info.flags)))
+    }
+}
+
+/// Device-independent handling of captured packets: decode the mix format to stereo
+/// `f32`, resample to 44.1 kHz `i16`, count discontinuities and flush the resampler
+/// when capture goes quiet. Every buffer is allocated in [`PacketConverter::new`].
+struct PacketConverter {
     format: SampleFormat,
     channels: usize,
     block_align: usize,
-    /// One packet of raw device bytes (buffer size × block align).
-    raw: Vec<u8>,
-    /// One packet decoded to stereo `f32`.
+    /// One packet decoded to stereo `f32` (sized for the largest packet).
     stereo: Vec<[f32; 2]>,
-    /// Resampled 44.1 kHz frames of one packet.
+    /// Resampled 44.1 kHz frames of one packet (or of one flush).
     frames: Vec<Frame>,
     resampler: StereoResampler,
-    /// True until the first packet was read. WASAPI flags that packet as a
+    /// True until the first packet was converted. WASAPI flags that packet as a
     /// discontinuity (the stream state changed), which is not a glitch.
     first_packet: bool,
+}
+
+impl PacketConverter {
+    /// A converter for packets of up to `max_packet_frames` frames in `format` with
+    /// `channels` interleaved channels at `sample_rate`.
+    fn new(
+        format: SampleFormat,
+        channels: usize,
+        sample_rate: u32,
+        max_packet_frames: usize,
+    ) -> Result<Self, CaptureError> {
+        if channels == 0 {
+            return Err(CaptureError::Device("mix format has no channels".into()));
+        }
+        let max_packet_frames = max_packet_frames.max(1);
+        let resampler = StereoResampler::new(sample_rate, max_packet_frames)
+            .map_err(|e| CaptureError::Device(e.to_string()))?;
+        let frames = vec![[0; 2]; resampler.max_output_frames(max_packet_frames)];
+        Ok(Self {
+            format,
+            channels,
+            block_align: channels * format.bytes(),
+            stereo: vec![[0.0; 2]; max_packet_frames],
+            frames,
+            resampler,
+            first_packet: true,
+        })
+    }
+
+    /// Bytes of the largest packet: the size of the raw read buffer.
+    fn max_packet_bytes(&self) -> usize {
+        self.stereo.len() * self.block_align
+    }
+
+    /// Convert one packet of `frames` device frames held at the front of `raw` and
+    /// return the 44.1 kHz frames it produced (possibly none).
+    ///
+    /// A silent packet becomes zeros whatever its bytes hold. A discontinuity is
+    /// added to `discontinuities` unless it is flagged on the stream's first packet.
+    /// `frames` is clamped to what both `raw` and the preallocated buffers hold
+    /// (WASAPI never returns more than the read buffer, which is sized the same way).
+    fn packet(
+        &mut self,
+        frames: usize,
+        flags: PacketFlags,
+        raw: &[u8],
+        discontinuities: &AtomicU64,
+    ) -> Result<&[Frame], ResampleError> {
+        if flags.discontinuity && !self.first_packet {
+            discontinuities.fetch_add(1, Ordering::Relaxed);
+        }
+        self.first_packet = false;
+        let frames = frames
+            .min(self.stereo.len())
+            .min(raw.len() / self.block_align);
+        let stereo = &mut self.stereo[..frames];
+        if flags.silent {
+            stereo.fill([0.0; 2]);
+        } else {
+            let bytes = &raw[..frames * self.block_align];
+            decode_stereo(self.format, self.channels, bytes, stereo);
+        }
+        let produced = self.resampler.process(stereo, &mut self.frames)?;
+        Ok(&self.frames[..produced])
+    }
+
+    /// End of one wake of the capture loop. When the wait timed out and no packet
+    /// was drained, capture went quiet: push the resampler's delayed tail out so the
+    /// end of a sound is not held back. Returns the frames to publish (none on any
+    /// other wake, and none again until more audio was converted).
+    fn after_wake(&mut self, signaled: bool, drained: usize) -> Result<&[Frame], ResampleError> {
+        if signaled || drained > 0 {
+            return Ok(&[]);
+        }
+        let produced = self.resampler.flush(&mut self.frames)?;
+        Ok(&self.frames[..produced])
+    }
+}
+
+/// The device-independent capture loop: drains a [`PacketSource`] through a
+/// [`PacketConverter`] into the ring.
+struct DrainLoop<S> {
+    source: S,
+    /// One packet of raw device bytes (largest packet × block align).
+    raw: Vec<u8>,
+    converter: PacketConverter,
+}
+
+impl<S: PacketSource> DrainLoop<S> {
+    fn new(source: S, converter: PacketConverter) -> Self {
+        Self {
+            source,
+            raw: vec![0; converter.max_packet_bytes()],
+            converter,
+        }
+    }
+
+    /// Wait for `packet_event` (at most `timeout` each time) and handle every wake
+    /// until stop is requested or an error ends capture. Allocation-, log- and
+    /// lock-free until it returns.
+    fn run(
+        &mut self,
+        packet_event: HANDLE,
+        producer: &mut RingProducer,
+        shared: &Shared,
+        timeout: Duration,
+    ) -> CaptureExit {
+        let handles = [shared.stop.handle(), packet_event];
+        loop {
+            let signaled = match wait_any(&handles, Some(timeout)) {
+                Ok(Wait::Signaled(0)) => return CaptureExit::Stopped,
+                Ok(Wait::Signaled(_)) => true,
+                Ok(Wait::Timeout) => false,
+                Err(e) => return CaptureExit::Failed(format!("waiting for audio failed: {e}")),
+            };
+            if shared.stop_requested.load(Ordering::Acquire) {
+                return CaptureExit::Stopped;
+            }
+            if let Err(e) = self.wake(signaled, producer, &shared.discontinuities) {
+                return e.into_exit();
+            }
+        }
+    }
+
+    /// One wake: drain every queued packet, then flush the resampler if the wait
+    /// timed out with nothing queued. Returns the device frames drained.
+    fn wake(
+        &mut self,
+        signaled: bool,
+        producer: &mut RingProducer,
+        discontinuities: &AtomicU64,
+    ) -> Result<usize, StreamError> {
+        let drained = self.drain(producer, discontinuities)?;
+        publish(producer, self.converter.after_wake(signaled, drained)?);
+        Ok(drained)
+    }
+
+    /// Read, convert and publish every queued packet; returns the device frames
+    /// consumed.
+    fn drain(
+        &mut self,
+        producer: &mut RingProducer,
+        discontinuities: &AtomicU64,
+    ) -> Result<usize, StreamError> {
+        let mut total = 0;
+        while self.source.next_packet_frames()? > 0 {
+            let (frames, flags) = self.source.read_packet(&mut self.raw)?;
+            let converted = self
+                .converter
+                .packet(frames, flags, &self.raw, discontinuities)?;
+            publish(producer, converted);
+            if frames == 0 {
+                break;
+            }
+            total += frames;
+        }
+        Ok(total)
+    }
+}
+
+/// An open, initialised WASAPI capture stream with all buffers preallocated.
+struct Stream {
+    // Field order is drop order: the capture client (inside the loop) before the
+    // audio client, and the client before its event handle.
+    drain: DrainLoop<AudioCaptureClient>,
+    client: AudioClient,
+    event: wasapi::Handle,
+    info: CaptureInfo,
 }
 
 impl Stream {
@@ -440,9 +656,7 @@ impl Stream {
         let capture = client
             .get_audiocaptureclient()
             .map_err(|e| device_error(&e))?;
-        let resampler = StereoResampler::new(sample_rate, buffer_frames)
-            .map_err(|e| CaptureError::Device(e.to_string()))?;
-        let frames = vec![[0i16; 2]; resampler.max_output_frames(buffer_frames)];
+        let converter = PacketConverter::new(format, channels, sample_rate, buffer_frames)?;
         tracing::info!(
             "capturing {:?} ({}): {} Hz, {} ch, {}, buffer {} frames, {}",
             device_info.display_name,
@@ -451,14 +665,17 @@ impl Stream {
             channels,
             format.name(),
             buffer_frames,
-            if resampler.is_bypass() {
+            if converter.resampler.is_bypass() {
                 "no resampling".to_owned()
             } else {
-                format!("resampler delay {} frames", resampler.output_delay())
+                format!(
+                    "resampler delay {} frames",
+                    converter.resampler.output_delay()
+                )
             }
         );
         Ok(Self {
-            capture,
+            drain: DrainLoop::new(capture, converter),
             client,
             event,
             info: CaptureInfo {
@@ -468,82 +685,7 @@ impl Stream {
                 channels: mix.get_nchannels(),
                 format: format.name().into(),
             },
-            format,
-            channels,
-            block_align,
-            raw: vec![0; buffer_frames * block_align],
-            stereo: vec![[0.0; 2]; buffer_frames],
-            frames,
-            resampler,
-            first_packet: true,
         })
-    }
-
-    /// The drain loop. Allocation-, log- and lock-free until it returns.
-    fn run(&mut self, producer: &mut RingProducer, shared: &Shared) -> CaptureExit {
-        let handles = [shared.stop.handle(), self.event.as_handle()];
-        loop {
-            let signaled = match wait_any(&handles, Some(WAIT_TIMEOUT)) {
-                Ok(Wait::Signaled(0)) => return CaptureExit::Stopped,
-                Ok(Wait::Signaled(_)) => true,
-                Ok(Wait::Timeout) => false,
-                Err(e) => return CaptureExit::Failed(format!("waiting for audio failed: {e}")),
-            };
-            if shared.stop_requested.load(Ordering::Acquire) {
-                return CaptureExit::Stopped;
-            }
-            let drained = match self.drain(producer, shared) {
-                Ok(frames) => frames,
-                Err(e) => return e.into_exit(),
-            };
-            if !signaled
-                && drained == 0
-                && let Err(e) = self.flush(producer)
-            {
-                return e.into_exit();
-            }
-        }
-    }
-
-    /// Read every queued packet; returns the device frames consumed.
-    fn drain(
-        &mut self,
-        producer: &mut RingProducer,
-        shared: &Shared,
-    ) -> Result<usize, StreamError> {
-        let mut total = 0;
-        while self.capture.get_next_packet_size()?.unwrap_or(0) > 0 {
-            let (frames, info) = self.capture.read_from_device(&mut self.raw)?;
-            if info.flags.data_discontinuity && !self.first_packet {
-                shared.discontinuities.fetch_add(1, Ordering::Relaxed);
-            }
-            self.first_packet = false;
-            let frames = frames as usize;
-            if frames == 0 {
-                break;
-            }
-            // `read_from_device` rejects packets larger than the buffer it was given,
-            // which is sized from the WASAPI buffer, so this always fits.
-            let capacity = self.stereo.len();
-            let stereo = &mut self.stereo[..frames.min(capacity)];
-            if info.flags.silent {
-                stereo.fill([0.0; 2]);
-            } else {
-                let bytes = &self.raw[..stereo.len() * self.block_align];
-                decode_stereo(self.format, self.channels, bytes, stereo);
-            }
-            let produced = self.resampler.process(stereo, &mut self.frames)?;
-            publish(producer, &self.frames[..produced]);
-            total += frames;
-        }
-        Ok(total)
-    }
-
-    /// Push the resampler's delayed tail out after capture went quiet.
-    fn flush(&mut self, producer: &mut RingProducer) -> Result<(), StreamError> {
-        let produced = self.resampler.flush(&mut self.frames)?;
-        publish(producer, &self.frames[..produced]);
-        Ok(())
     }
 }
 
@@ -608,7 +750,7 @@ mod test_hooks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use winpods_rt::ring;
+    use winpods_rt::{RingShared, ring};
 
     fn start(source: &CaptureSource, producer: RingProducer) -> CaptureHandle {
         match CaptureHandle::start(source, producer) {
@@ -740,5 +882,434 @@ mod tests {
         let written = consumer.shared().written();
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(consumer.shared().written(), written, "thread still writing");
+    }
+
+    // ---- The device-independent capture loop, driven by scripted packets. ----
+
+    /// HRESULT of `AUDCLNT_E_DEVICE_INVALIDATED` (the `windows` crate defines it only
+    /// behind the `Win32_Media_Audio` feature, which this crate does not enable).
+    const AUDCLNT_E_DEVICE_INVALIDATED: i32 = 0x8889_0004_u32 as i32;
+
+    const PLAIN: PacketFlags = PacketFlags {
+        silent: false,
+        discontinuity: false,
+    };
+    const SILENT: PacketFlags = PacketFlags {
+        silent: true,
+        discontinuity: false,
+    };
+    const DISCONTINUITY: PacketFlags = PacketFlags {
+        silent: false,
+        discontinuity: true,
+    };
+
+    fn device_invalidated() -> WasapiError {
+        WasapiError::Windows(windows::core::Error::from_hresult(windows::core::HRESULT(
+            AUDCLNT_E_DEVICE_INVALIDATED,
+        )))
+    }
+
+    fn f32_bytes(frames: &[[f32; 2]]) -> Vec<u8> {
+        frames
+            .as_flattened()
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect()
+    }
+
+    fn constant(level: f32, frames: usize) -> Vec<[f32; 2]> {
+        vec![[level, level]; frames]
+    }
+
+    /// A 1 kHz sine at half scale, 48 kHz.
+    fn sine_48k(frames: usize) -> Vec<[f32; 2]> {
+        (0..frames)
+            .map(|n| {
+                let phase = std::f64::consts::TAU * 1_000.0 * n as f64 / 48_000.0;
+                let v = (0.5 * phase.sin()) as f32;
+                [v, v]
+            })
+            .collect()
+    }
+
+    /// Stereo `f32` converter for packets of up to 480 frames.
+    fn converter(rate: u32) -> PacketConverter {
+        PacketConverter::new(SampleFormat::F32, 2, rate, 480).unwrap()
+    }
+
+    #[test]
+    fn silent_packets_become_zeros_whatever_their_bytes() {
+        let counter = AtomicU64::new(0);
+        let raw = f32_bytes(&constant(0.5, 64));
+        // At 44.1 kHz (bypass) output frames map 1:1 to input frames.
+        let mut conv = converter(44_100);
+        let out = conv.packet(64, SILENT, &raw, &counter).unwrap();
+        assert_eq!(out.len(), 64);
+        assert!(out.iter().all(|f| *f == [0, 0]), "{out:?}");
+        // The same bytes without the flag are audio.
+        let out = conv.packet(64, PLAIN, &raw, &counter).unwrap();
+        assert!(out.iter().all(|f| *f == [16_384, 16_384]), "{out:?}");
+        // Through the resampler and from an integer mix format, too.
+        let loud: Vec<u8> = [i16::MAX; 2 * 480]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        let mut conv = PacketConverter::new(SampleFormat::I16, 2, 48_000, 480).unwrap();
+        let out = conv.packet(480, SILENT, &loud, &counter).unwrap();
+        assert!(!out.is_empty());
+        assert!(out.iter().all(|f| *f == [0, 0]));
+        let tail = conv.after_wake(false, 0).unwrap();
+        assert!(tail.iter().all(|f| *f == [0, 0]));
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn discontinuities_are_counted_except_on_the_first_packet() {
+        let counter = AtomicU64::new(0);
+        let count = || counter.load(Ordering::Relaxed);
+        let raw = f32_bytes(&constant(0.25, 32));
+        let mut conv = converter(44_100);
+        conv.packet(32, DISCONTINUITY, &raw, &counter).unwrap();
+        assert_eq!(count(), 0, "the first packet's flag is not a glitch");
+        conv.packet(32, PLAIN, &raw, &counter).unwrap();
+        assert_eq!(count(), 0);
+        conv.packet(32, DISCONTINUITY, &raw, &counter).unwrap();
+        assert_eq!(count(), 1);
+        let both = PacketFlags {
+            silent: true,
+            discontinuity: true,
+        };
+        conv.packet(32, both, &raw, &counter).unwrap();
+        assert_eq!(count(), 2);
+        // A packet that read empty still reports its discontinuity.
+        assert!(
+            conv.packet(0, DISCONTINUITY, &raw, &counter)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(count(), 3);
+        // Only the very first packet is exempt, whatever its own flags.
+        let mut conv = converter(44_100);
+        conv.packet(32, PLAIN, &raw, &counter).unwrap();
+        conv.packet(32, DISCONTINUITY, &raw, &counter).unwrap();
+        assert_eq!(count(), 4);
+    }
+
+    #[test]
+    fn idle_timeout_flushes_the_resampler_tail_once() {
+        let counter = AtomicU64::new(0);
+        let raw = f32_bytes(&sine_48k(480));
+        let mut conv = converter(48_000);
+        let produced = conv.packet(480, PLAIN, &raw, &counter).unwrap().len();
+        assert!(produced > 0);
+        // A wake that was signaled or drained packets never flushes.
+        assert!(conv.after_wake(true, 0).unwrap().is_empty());
+        assert!(conv.after_wake(false, 480).unwrap().is_empty());
+        assert!(conv.after_wake(true, 480).unwrap().is_empty());
+        // An idle timeout pushes the delayed end of the sine out...
+        let tail = conv.after_wake(false, 0).unwrap();
+        assert!(tail.iter().any(|f| f[0] != 0), "tail {tail:?}");
+        // ...so all of the 480 input frames (441 at 44.1 kHz) have come out.
+        assert!(produced + tail.len() >= 441, "{produced} + {}", tail.len());
+        // Only once: further idle timeouts have nothing left to flush.
+        assert!(conv.after_wake(false, 0).unwrap().is_empty());
+        // New audio arms it again.
+        conv.packet(480, PLAIN, &raw, &counter).unwrap();
+        assert!(!conv.after_wake(false, 0).unwrap().is_empty());
+        // Without resampling nothing is held back.
+        let mut conv = converter(44_100);
+        conv.packet(480, PLAIN, &raw, &counter).unwrap();
+        assert!(conv.after_wake(false, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn oversized_packets_are_clamped_to_the_buffers() {
+        let counter = AtomicU64::new(0);
+        let mut conv = PacketConverter::new(SampleFormat::F32, 2, 44_100, 64).unwrap();
+        assert_eq!(conv.max_packet_bytes(), 64 * 8);
+        // More frames than the converter was sized for...
+        let raw = f32_bytes(&constant(0.5, 100));
+        assert_eq!(conv.packet(1_000, PLAIN, &raw, &counter).unwrap().len(), 64);
+        // ...or than the bytes hold (only whole frames count).
+        let raw = f32_bytes(&constant(0.5, 10));
+        assert_eq!(conv.packet(1_000, PLAIN, &raw, &counter).unwrap().len(), 10);
+        let partial = &raw[..raw.len() - 3];
+        assert_eq!(conv.packet(64, PLAIN, partial, &counter).unwrap().len(), 9);
+        assert!(PacketConverter::new(SampleFormat::F32, 0, 48_000, 64).is_err());
+        assert!(PacketConverter::new(SampleFormat::F32, 2, 0, 64).is_err());
+    }
+
+    #[test]
+    fn packet_flags_from_wasapi() {
+        assert_eq!(PacketFlags::from(&BufferFlags::new(0)), PLAIN);
+        assert_eq!(PacketFlags::from(&BufferFlags::new(1)), DISCONTINUITY);
+        assert_eq!(PacketFlags::from(&BufferFlags::new(2)), SILENT);
+        let both = PacketFlags {
+            silent: true,
+            discontinuity: true,
+        };
+        assert_eq!(PacketFlags::from(&BufferFlags::new(3)), both);
+        // Timestamp errors are not acted on.
+        assert_eq!(PacketFlags::from(&BufferFlags::new(4)), PLAIN);
+    }
+
+    #[test]
+    fn wasapi_errors_end_capture_as_device_lost() {
+        let error = device_invalidated();
+        let detail = error.to_string();
+        assert_eq!(
+            StreamError::from(error).into_exit(),
+            CaptureExit::DeviceLost {
+                hresult: 0x8889_0004_u32 as i32,
+                detail,
+            }
+        );
+        // A wasapi error without an HRESULT still means the stream is gone (E_FAIL).
+        let error = WasapiError::DataLengthTooShort {
+            received: 1,
+            expected: 2,
+        };
+        let detail = error.to_string();
+        assert_eq!(
+            StreamError::from(error).into_exit(),
+            CaptureExit::DeviceLost {
+                hresult: 0x8000_4005_u32 as i32,
+                detail,
+            }
+        );
+        // Resampler errors are internal failures, not a lost device.
+        assert_eq!(
+            StreamError::from(ResampleError::InvalidRate(0)).into_exit(),
+            CaptureExit::Failed("resampling failed: invalid input sample rate: 0 Hz".into())
+        );
+    }
+
+    /// What the scripted source answers to one `next_packet_frames` poll.
+    enum Poll {
+        /// A queued packet of stereo `f32` frames.
+        Packet(Vec<[f32; 2]>, PacketFlags),
+        /// Nothing queued.
+        Empty,
+        /// One frame announced, but the read returns no frames (with these flags).
+        ReadsEmpty(PacketFlags),
+        /// One frame announced, but reading it fails with a device error.
+        ReadFails,
+    }
+
+    /// A [`PacketSource`] replaying a script. Once the script is exhausted every poll
+    /// fails with `AUDCLNT_E_DEVICE_INVALIDATED`, as when the device is unplugged.
+    struct ScriptedSource {
+        script: std::vec::IntoIter<Poll>,
+        pending: Option<Poll>,
+        ring: Arc<RingShared>,
+        /// Frames the ring had received when each poll happened.
+        written_at_poll: Vec<u64>,
+    }
+
+    impl ScriptedSource {
+        fn new(script: Vec<Poll>, ring: &Arc<RingShared>) -> Self {
+            Self {
+                script: script.into_iter(),
+                pending: None,
+                ring: Arc::clone(ring),
+                // Preallocated so polling does not allocate.
+                written_at_poll: Vec::with_capacity(64),
+            }
+        }
+    }
+
+    impl PacketSource for ScriptedSource {
+        fn next_packet_frames(&mut self) -> Result<usize, WasapiError> {
+            self.written_at_poll.push(self.ring.written());
+            let poll = self.script.next().ok_or_else(device_invalidated)?;
+            let frames = match &poll {
+                Poll::Packet(frames, _) => frames.len(),
+                Poll::Empty => 0,
+                Poll::ReadsEmpty(_) | Poll::ReadFails => 1,
+            };
+            self.pending = Some(poll);
+            Ok(frames)
+        }
+
+        fn read_packet(&mut self, buffer: &mut [u8]) -> Result<(usize, PacketFlags), WasapiError> {
+            match self.pending.take() {
+                Some(Poll::Packet(frames, flags)) => {
+                    let samples = frames.as_flattened();
+                    let (slots, _) = buffer.as_chunks_mut::<4>();
+                    for (dst, sample) in slots.iter_mut().zip(samples) {
+                        *dst = sample.to_le_bytes();
+                    }
+                    Ok((frames.len(), flags))
+                }
+                Some(Poll::ReadsEmpty(flags)) => Ok((0, flags)),
+                Some(Poll::ReadFails) => Err(device_invalidated()),
+                Some(Poll::Empty) | None => Ok((0, PacketFlags::default())),
+            }
+        }
+    }
+
+    fn drain_loop(
+        rate: u32,
+        script: Vec<Poll>,
+        ring: &Arc<RingShared>,
+    ) -> DrainLoop<ScriptedSource> {
+        DrainLoop::new(ScriptedSource::new(script, ring), converter(rate))
+    }
+
+    #[test]
+    fn a_wake_drains_every_queued_packet_without_allocating() {
+        let (mut producer, mut consumer) = ring::ring(4_096).unwrap();
+        let script = vec![
+            Poll::Packet(constant(0.25, 100), DISCONTINUITY),
+            Poll::Packet(constant(0.5, 50), DISCONTINUITY),
+            Poll::Packet(constant(0.5, 30), SILENT),
+            Poll::Empty,
+        ];
+        let mut drain = drain_loop(44_100, script, producer.shared());
+        let counter = AtomicU64::new(0);
+        let before = crate::test_alloc::allocations();
+        let drained = drain.wake(true, &mut producer, &counter).unwrap();
+        assert_eq!(
+            crate::test_alloc::allocations(),
+            before,
+            "the wake allocated"
+        );
+        assert_eq!(drained, 180);
+        assert_eq!(drain.source.written_at_poll, [0, 100, 150, 180]);
+        assert_eq!(counter.load(Ordering::Relaxed), 1, "first packet exempt");
+        let shared = producer.shared();
+        assert_eq!(shared.written(), 180);
+        assert_eq!(shared.last_chunk(), 30);
+        assert_eq!(shared.peak(), 0.0, "the last chunk was silent");
+        let mut chunk = [[0i16; 2]; 100];
+        assert!(consumer.pop_exact(&mut chunk));
+        assert!(chunk.iter().all(|f| *f == [8_192, 8_192]));
+        assert!(consumer.pop_exact(&mut chunk[..50]));
+        assert!(chunk[..50].iter().all(|f| *f == [16_384, 16_384]));
+        assert!(consumer.pop_exact(&mut chunk[..30]));
+        assert!(chunk[..30].iter().all(|f| *f == [0, 0]));
+
+        // Resampling and the idle flush do not allocate either.
+        let (mut producer, _consumer) = ring::ring(4_096).unwrap();
+        let script = vec![Poll::Packet(sine_48k(480), PLAIN), Poll::Empty, Poll::Empty];
+        let mut drain = drain_loop(48_000, script, producer.shared());
+        let before = crate::test_alloc::allocations();
+        assert_eq!(drain.wake(true, &mut producer, &counter).unwrap(), 480);
+        assert_eq!(drain.wake(false, &mut producer, &counter).unwrap(), 0);
+        assert_eq!(
+            crate::test_alloc::allocations(),
+            before,
+            "resampling allocated"
+        );
+        let polls = &drain.source.written_at_poll;
+        assert!(producer.shared().written() > polls[2], "{polls:?}");
+    }
+
+    /// A packet that is announced but reads empty ends the drain instead of spinning;
+    /// the next wake picks up what is still queued.
+    #[test]
+    fn a_packet_that_reads_empty_ends_the_drain() {
+        let (mut producer, _consumer) = ring::ring(4_096).unwrap();
+        let script = vec![
+            Poll::Packet(constant(0.5, 10), PLAIN),
+            Poll::ReadsEmpty(DISCONTINUITY),
+            Poll::Packet(constant(0.5, 20), PLAIN),
+            Poll::Empty,
+        ];
+        let mut drain = drain_loop(44_100, script, producer.shared());
+        let counter = AtomicU64::new(0);
+        assert_eq!(drain.wake(true, &mut producer, &counter).unwrap(), 10);
+        assert_eq!(drain.source.written_at_poll.len(), 2);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert_eq!(drain.wake(true, &mut producer, &counter).unwrap(), 20);
+        assert_eq!(producer.shared().written(), 30);
+    }
+
+    /// The loop end to end: a signaled wake drains the packet without flushing, the
+    /// first idle timeout flushes the resampler tail, the next one does nothing, and
+    /// a WASAPI error ends capture as `DeviceLost` with its HRESULT.
+    #[test]
+    fn run_flushes_once_when_idle_and_ends_with_device_lost() {
+        let (mut producer, _consumer) = ring::ring(4_096).unwrap();
+        let script = vec![
+            Poll::Packet(sine_48k(480), PLAIN), // wake 1 (signaled)
+            Poll::Empty,                        // wake 1: queue drained
+            Poll::Empty,                        // wake 2 (timeout): flush
+            Poll::Empty,                        // wake 3 (timeout): nothing to flush
+        ]; // wake 4: AUDCLNT_E_DEVICE_INVALIDATED
+        let mut drain = drain_loop(48_000, script, producer.shared());
+        let shared = Shared::new().unwrap();
+        let packet_event = AutoEvent::new().unwrap();
+        packet_event.set();
+        let timeout = Duration::from_millis(5);
+        let exit = drain.run(packet_event.handle(), &mut producer, &shared, timeout);
+        assert_eq!(
+            exit,
+            CaptureExit::DeviceLost {
+                hresult: AUDCLNT_E_DEVICE_INVALIDATED,
+                detail: device_invalidated().to_string(),
+            }
+        );
+        let polls = &drain.source.written_at_poll;
+        assert_eq!(polls.len(), 5, "{polls:?}");
+        let (packet, flushed) = (polls[1], polls[3]);
+        assert_eq!(polls[0], 0);
+        assert!(packet > 0, "{polls:?}");
+        assert_eq!(
+            polls[2], packet,
+            "a signaled wake does not flush: {polls:?}"
+        );
+        assert!(
+            flushed > packet,
+            "the first idle timeout flushes: {polls:?}"
+        );
+        assert_eq!(
+            polls[4], flushed,
+            "the second has nothing to flush: {polls:?}"
+        );
+        assert_eq!(producer.shared().written(), flushed);
+        assert_eq!(shared.discontinuities.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn read_errors_end_capture_as_device_lost() {
+        let (mut producer, _consumer) = ring::ring(4_096).unwrap();
+        let script = vec![Poll::Packet(constant(0.5, 10), PLAIN), Poll::ReadFails];
+        let mut drain = drain_loop(44_100, script, producer.shared());
+        let shared = Shared::new().unwrap();
+        let packet_event = AutoEvent::new().unwrap();
+        packet_event.set();
+        let exit = drain.run(packet_event.handle(), &mut producer, &shared, WAIT_TIMEOUT);
+        assert!(
+            matches!(
+                exit,
+                CaptureExit::DeviceLost {
+                    hresult: AUDCLNT_E_DEVICE_INVALIDATED,
+                    ..
+                }
+            ),
+            "{exit:?}"
+        );
+        assert_eq!(
+            producer.shared().written(),
+            10,
+            "audio before the error is published"
+        );
+        assert_eq!(drain.source.written_at_poll.len(), 2);
+    }
+
+    #[test]
+    fn a_stop_request_ends_the_loop_before_polling() {
+        let (mut producer, _consumer) = ring::ring(4_096).unwrap();
+        let script = vec![Poll::Packet(sine_48k(480), PLAIN)];
+        let mut drain = drain_loop(48_000, script, producer.shared());
+        let shared = Shared::new().unwrap();
+        let packet_event = AutoEvent::new().unwrap();
+        packet_event.set();
+        shared.request_stop();
+        let exit = drain.run(packet_event.handle(), &mut producer, &shared, WAIT_TIMEOUT);
+        assert_eq!(exit, CaptureExit::Stopped);
+        assert!(drain.source.written_at_poll.is_empty());
+        assert_eq!(producer.shared().written(), 0);
     }
 }
