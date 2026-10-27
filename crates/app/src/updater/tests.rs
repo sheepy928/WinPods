@@ -576,6 +576,55 @@ fn redirect_locations_resolve() {
 }
 
 #[test]
+fn connections_are_closed_after_a_check_not_kept_for_reuse() {
+    // A keep-alive server (unlike `Server`, no `Connection: close`): after one
+    // answer it waits to see whether the client closes its end.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap() > 0 && line != "\r\n" {
+            line.clear();
+        }
+        // A 200 whose body the client reads to the end (an error status is never
+        // pooled, so it would show nothing).
+        let body = b"not json";
+        let mut out = stream;
+        write!(
+            out,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        out.write_all(body).unwrap();
+        out.flush().unwrap();
+        reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut rest = [0u8; 16];
+        let closed = matches!(io::Read::read(reader.get_mut(), &mut rest), Ok(0));
+        let _ = closed_tx.send(closed);
+    });
+
+    let fx = Fixture::new();
+    let options = UpdaterOptions {
+        api_base: base,
+        ..fx.options()
+    };
+    let updater = Updater::with_options(REPO, Version::new(0, 2, 0), options);
+    assert!(matches!(updater.check(None), Err(UpdateError::Other(_))));
+    let closed = closed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(closed, "the connection was kept open for reuse");
+    // The updater (and its agent) is still alive here.
+    drop(updater);
+}
+
+#[test]
 fn check_without_any_release_is_none() {
     let fx = Fixture::new(); // no route → 404
     assert_eq!(fx.updater().check(None).unwrap(), None);

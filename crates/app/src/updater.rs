@@ -195,6 +195,9 @@ impl Updater {
             .timeout_per_read(Some(READ_TIMEOUT))
             // Redirects are followed in `get`, which checks every hop's host.
             .max_redirects(0)
+            // Checks are a day apart: a pooled connection would only sit in
+            // CLOSE_WAIT once GitHub closes its end, until the next check.
+            .max_idle_connections(0)
             .user_agent(format!("WinPods/{current}"));
         if opts.allow_http_loopback {
             config = config.proxy(None);
