@@ -1,0 +1,536 @@
+{
+  "_meta": {
+    "generator": "tools/gen_fixtures.py",
+    "pyatv": "0.18.0",
+    "srptools": "1.0.1"
+  },
+  "device_id": "02:11:22:33:44:55",
+  "session_uuid": "2B5E7C1A-0000-4000-8000-0000000000AA",
+  "timing_peer_id": "E0B44A76-E30B-53A3-BF25-6D9E0C0452BD",
+  "rtsp_session_id": 305419896,
+  "local_ip": "192.168.1.57",
+  "remote_ip": "192.168.1.155",
+  "sender_name": "WinPods",
+  "events_write_key": "543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e231",
+  "receiver_txt": {
+    "_airplay._tcp": {
+      "acl": "0",
+      "btaddr": "02:BB:CC:DD:EE:FF",
+      "deviceid": "02:AA:BB:CC:DD:EE",
+      "c": "9",
+      "fex": "AMp/StBLNTwQoa7YDQ",
+      "features": "0x4A7FCA00,0x3C354BD0",
+      "flags": "0x1a0404",
+      "gid": "0A0A0A0A-0000-4000-8000-000000000001",
+      "igl": "1",
+      "gcgl": "1",
+      "model": "AudioAccessory5,1",
+      "protovers": "1.1",
+      "pi": "0b0b0b0b-0000-4000-8000-000000000002",
+      "psi": "0C0C0C0C-0000-4000-8000-000000000003",
+      "pk": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "srcvers": "980.77.2",
+      "osvers": "27.0",
+      "vv": "1"
+    },
+    "_raop._tcp": {
+      "cn": "0,1,2,3",
+      "da": "true",
+      "et": "0,3,5",
+      "ft": "0x4A7FCA00,0x3C354BD0",
+      "sf": "0x1a0404",
+      "md": "0,1,2",
+      "am": "AudioAccessory5,1",
+      "pk": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "tp": "UDP",
+      "vn": "65537",
+      "vs": "980.77.2",
+      "ov": "27.0",
+      "vv": "1"
+    }
+  },
+  "base": [
+    {
+      "name": "ptp_standard_ports",
+      "timing_protocol": "PTP",
+      "ptp": {
+        "port": 319,
+        "standard_ports": true
+      },
+      "timing_server_port": 6002,
+      "receiver_ids": [
+        "0A0A0A0A-0000-4000-8000-000000000001",
+        "0b0b0b0b-0000-4000-8000-000000000002",
+        "0C0C0C0C-0000-4000-8000-000000000003"
+      ],
+      "receiver_ids_from_txt": [
+        "0A0A0A0A-0000-4000-8000-000000000001",
+        "0b0b0b0b-0000-4000-8000-000000000002",
+        "0C0C0C0C-0000-4000-8000-000000000003"
+      ],
+      "body": {
+        "deviceID": "02:11:22:33:44:55",
+        "sessionUUID": "2B5E7C1A-0000-4000-8000-0000000000AA",
+        "timingProtocol": "PTP",
+        "isMultiSelectAirPlay": true,
+        "groupContainsGroupLeader": false,
+        "macAddress": "02:11:22:33:44:55",
+        "model": "iPhone14,3",
+        "name": "WinPods",
+        "osBuildVersion": "20F66",
+        "osName": "iPhone OS",
+        "osVersion": "16.5",
+        "senderSupportsRelay": false,
+        "sourceVersion": "690.7.1",
+        "statsCollectionEnabled": false,
+        "timingPeerInfo": {
+          "Addresses": ["192.168.1.57"],
+          "ID": "E0B44A76-E30B-53A3-BF25-6D9E0C0452BD",
+          "SupportsClockPortMatchingOverride": true
+        }
+      },
+      "body_bplist": "62706c6973743030df100f0102030405060708090a0b0c0d0e0f101112101314151617111819111a215864657669636549445f101867726f7570436f6e7461696e7347726f75704c65616465725f101469734d756c746953656c656374416972506c61795a6d616341646472657373556d6f64656c546e616d655e6f734275696c6456657273696f6e566f734e616d65596f7356657273696f6e5f101373656e646572537570706f72747352656c61795b73657373696f6e555549445d736f7572636556657273696f6e5f10167374617473436f6c6c656374696f6e456e61626c65645e74696d696e6750656572496e666f5e74696d696e6750726f746f636f6c5f101130323a31313a32323a33333a34343a353508095a6950686f6e6531342c335757696e506f6473553230463636596950686f6e65204f535431362e355f102432423545374331412d303030302d343030302d383030302d303030303030303030304141573639302e372e31d31b1c1d1e2012594164647265737365735249445f1021537570706f727473436c6f636b506f72744d61746368696e674f76657272696465a11f5c3139322e3136382e312e35375f102445304234344137362d453330422d353341332d424632352d36443945304330343532424453505450000800290032004d0064006f0075007a00890090009a00b000bc00ca00e300f201010115011601170122012a0130013a013f0166016e0175017f018201a601a801b501dc00000000000002010000000000000022000000000000000000000000000001e0",
+      "response_name": "ptp",
+      "read": {
+        "receiver_clock_id": 192172642282561006,
+        "event_channel": {
+          "address": "192.168.1.155",
+          "port": 50001,
+          "salt": "Events-Salt",
+          "output_info": "Events-Read-Encryption-Key",
+          "input_info": "Events-Write-Encryption-Key"
+        }
+      }
+    },
+    {
+      "name": "ntp",
+      "timing_protocol": "NTP",
+      "ptp": null,
+      "timing_server_port": 6002,
+      "receiver_ids": [
+        "0A0A0A0A-0000-4000-8000-000000000001",
+        "0b0b0b0b-0000-4000-8000-000000000002",
+        "0C0C0C0C-0000-4000-8000-000000000003"
+      ],
+      "receiver_ids_from_txt": [
+        "0A0A0A0A-0000-4000-8000-000000000001",
+        "0b0b0b0b-0000-4000-8000-000000000002",
+        "0C0C0C0C-0000-4000-8000-000000000003"
+      ],
+      "body": {
+        "deviceID": "02:11:22:33:44:55",
+        "sessionUUID": "2B5E7C1A-0000-4000-8000-0000000000AA",
+        "timingProtocol": "NTP",
+        "isMultiSelectAirPlay": true,
+        "groupContainsGroupLeader": false,
+        "macAddress": "02:11:22:33:44:55",
+        "model": "iPhone14,3",
+        "name": "WinPods",
+        "osBuildVersion": "20F66",
+        "osName": "iPhone OS",
+        "osVersion": "16.5",
+        "senderSupportsRelay": false,
+        "sourceVersion": "690.7.1",
+        "statsCollectionEnabled": false,
+        "timingPort": 6002
+      },
+      "body_bplist": "62706c6973743030df100f0102030405060708090a0b0c0d0e0f101112101314151617111819111a1b5864657669636549445f101867726f7570436f6e7461696e7347726f75704c65616465725f101469734d756c746953656c656374416972506c61795a6d616341646472657373556d6f64656c546e616d655e6f734275696c6456657273696f6e566f734e616d65596f7356657273696f6e5f101373656e646572537570706f72747352656c61795b73657373696f6e555549445d736f7572636556657273696f6e5f10167374617473436f6c6c656374696f6e456e61626c65645a74696d696e67506f72745e74696d696e6750726f746f636f6c5f101130323a31313a32323a33333a34343a353508095a6950686f6e6531342c335757696e506f6473553230463636596950686f6e65204f535431362e355f102432423545374331412d303030302d343030302d383030302d303030303030303030304141573639302e372e31111772534e5450000800290032004d0064006f0075007a00890090009a00b000bc00ca00e300ee00fd011101120113011e0126012c0136013b0162016a016d0000000000000201000000000000001c00000000000000000000000000000171",
+      "response_name": "ntp",
+      "read": {
+        "receiver_clock_id": null,
+        "event_channel": {
+          "address": "192.168.1.155",
+          "port": 50002,
+          "salt": "Events-Salt",
+          "output_info": "Events-Read-Encryption-Key",
+          "input_info": "Events-Write-Encryption-Key"
+        }
+      }
+    },
+    {
+      "name": "ptp_dynamic_port",
+      "timing_protocol": "PTP",
+      "ptp": {
+        "port": 50123,
+        "standard_ports": false
+      },
+      "timing_server_port": 6002,
+      "receiver_ids": ["0E0E0E0E-0000-4000-8000-000000000005", "0F0F0F0F-0000-4000-8000-000000000006"],
+      "receiver_ids_from_txt": [
+        "0A0A0A0A-0000-4000-8000-000000000001",
+        "0b0b0b0b-0000-4000-8000-000000000002",
+        "0C0C0C0C-0000-4000-8000-000000000003"
+      ],
+      "body": {
+        "deviceID": "02:11:22:33:44:55",
+        "sessionUUID": "2B5E7C1A-0000-4000-8000-0000000000AA",
+        "timingProtocol": "PTP",
+        "isMultiSelectAirPlay": true,
+        "groupContainsGroupLeader": false,
+        "macAddress": "02:11:22:33:44:55",
+        "model": "iPhone14,3",
+        "name": "WinPods",
+        "osBuildVersion": "20F66",
+        "osName": "iPhone OS",
+        "osVersion": "16.5",
+        "senderSupportsRelay": false,
+        "sourceVersion": "690.7.1",
+        "statsCollectionEnabled": false,
+        "timingPeerInfo": {
+          "Addresses": ["192.168.1.57"],
+          "ID": "E0B44A76-E30B-53A3-BF25-6D9E0C0452BD",
+          "SupportsClockPortMatchingOverride": true,
+          "ClockPorts": {
+            "0E0E0E0E-0000-4000-8000-000000000005": 50123,
+            "0F0F0F0F-0000-4000-8000-000000000006": 50123
+          }
+        }
+      },
+      "body_bplist": "62706c6973743030df100f0102030405060708090a0b0c0d0e0f101112101314151617111819111a265864657669636549445f101867726f7570436f6e7461696e7347726f75704c65616465725f101469734d756c746953656c656374416972506c61795a6d616341646472657373556d6f64656c546e616d655e6f734275696c6456657273696f6e566f734e616d65596f7356657273696f6e5f101373656e646572537570706f72747352656c61795b73657373696f6e555549445d736f7572636556657273696f6e5f10167374617473436f6c6c656374696f6e456e61626c65645e74696d696e6750656572496e666f5e74696d696e6750726f746f636f6c5f101130323a31313a32323a33333a34343a353508095a6950686f6e6531342c335757696e506f6473553230463636596950686f6e65204f535431362e355f102432423545374331412d303030302d343030302d383030302d303030303030303030304141573639302e372e31d41b1c1d1e1f212512594164647265737365735a436c6f636b506f7274735249445f1021537570706f727473436c6f636b506f72744d61746368696e674f76657272696465a1205c3139322e3136382e312e3537d2222324245f102430453045304530452d303030302d343030302d383030302d3030303030303030303030355f102430463046304630462d303030302d343030302d383030302d30303030303030303030303611c3cb5f102445304234344137362d453330422d353341332d424632352d36443945304330343532424453505450000800290032004d0064006f0075007a00890090009a00b000bc00ca00e300f201010115011601170122012a0130013a013f0166016e01770181018c018f01b301b501c201c701ee02150218023f0000000000000201000000000000002700000000000000000000000000000243",
+      "response_name": "ptp_signed_clock",
+      "read": {
+        "receiver_clock_id": 17485995211385265646,
+        "event_channel": {
+          "address": "192.168.1.155",
+          "port": 50003,
+          "salt": "Events-Salt",
+          "output_info": "Events-Read-Encryption-Key",
+          "input_info": "Events-Write-Encryption-Key"
+        }
+      }
+    }
+  ],
+  "stream": [
+    {
+      "codec": "alac",
+      "latency_ms": 75,
+      "latency_frames": 3308,
+      "latency_min": 3308,
+      "latency_max": 88200,
+      "control_client_port": 6001,
+      "body": {
+        "streams": [
+          {
+            "audioFormat": 262144,
+            "audioMode": "default",
+            "controlPort": 6001,
+            "ct": 2,
+            "isMedia": true,
+            "latencyMax": 88200,
+            "latencyMin": 3308,
+            "shk": {
+              "$data": "543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e231"
+            },
+            "spf": 352,
+            "sr": 44100,
+            "type": 96,
+            "supportsDynamicStreamID": false,
+            "streamConnectionID": 305419896
+          }
+        ]
+      },
+      "body_bplist": "62706c6973743030d101025773747265616d73a103dd0405060708090a0b0c0d0e0f101112131415161718191a1b1c1d5b617564696f466f726d617459617564696f4d6f64655b636f6e74726f6c506f72745263745769734d656469615a6c6174656e63794d61785a6c6174656e63794d696e5373686b537370665273725f101273747265616d436f6e6e656374696f6e49445f1017737570706f72747344796e616d696353747265616d4944547479706512000400005764656661756c741117711002091200015888110cec4f1020543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e23111016011ac441212345678081060080b1315303c4652555d6873777b7e93adb2b7bfc2c4c5cacdf0f3f6fbfc0000000000000101000000000000001e000000000000000000000000000000fe",
+      "read": {
+        "control_port": 50011,
+        "server_port": 50010,
+        "cipher_key": "543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e231"
+      }
+    },
+    {
+      "codec": "alac",
+      "latency_ms": 85,
+      "latency_frames": 3748,
+      "latency_min": 3748,
+      "latency_max": 88200,
+      "control_client_port": 6001,
+      "body": {
+        "streams": [
+          {
+            "audioFormat": 262144,
+            "audioMode": "default",
+            "controlPort": 6001,
+            "ct": 2,
+            "isMedia": true,
+            "latencyMax": 88200,
+            "latencyMin": 3748,
+            "shk": {
+              "$data": "543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e231"
+            },
+            "spf": 352,
+            "sr": 44100,
+            "type": 96,
+            "supportsDynamicStreamID": false,
+            "streamConnectionID": 305419896
+          }
+        ]
+      },
+      "body_bplist": "62706c6973743030d101025773747265616d73a103dd0405060708090a0b0c0d0e0f101112131415161718191a1b1c1d5b617564696f466f726d617459617564696f4d6f64655b636f6e74726f6c506f72745263745769734d656469615a6c6174656e63794d61785a6c6174656e63794d696e5373686b537370665273725f101273747265616d436f6e6e656374696f6e49445f1017737570706f72747344796e616d696353747265616d4944547479706512000400005764656661756c741117711002091200015888110ea44f1020543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e23111016011ac441212345678081060080b1315303c4652555d6873777b7e93adb2b7bfc2c4c5cacdf0f3f6fbfc0000000000000101000000000000001e000000000000000000000000000000fe",
+      "read": {
+        "control_port": 50011,
+        "server_port": 50010,
+        "cipher_key": "543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e231"
+      }
+    },
+    {
+      "codec": "alac",
+      "latency_ms": 100,
+      "latency_frames": 4410,
+      "latency_min": 4410,
+      "latency_max": 88200,
+      "control_client_port": 6001,
+      "body": {
+        "streams": [
+          {
+            "audioFormat": 262144,
+            "audioMode": "default",
+            "controlPort": 6001,
+            "ct": 2,
+            "isMedia": true,
+            "latencyMax": 88200,
+            "latencyMin": 4410,
+            "shk": {
+              "$data": "543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e231"
+            },
+            "spf": 352,
+            "sr": 44100,
+            "type": 96,
+            "supportsDynamicStreamID": false,
+            "streamConnectionID": 305419896
+          }
+        ]
+      },
+      "body_bplist": "62706c6973743030d101025773747265616d73a103dd0405060708090a0b0c0d0e0f101112131415161718191a1b1c1d5b617564696f466f726d617459617564696f4d6f64655b636f6e74726f6c506f72745263745769734d656469615a6c6174656e63794d61785a6c6174656e63794d696e5373686b537370665273725f101273747265616d436f6e6e656374696f6e49445f1017737570706f72747344796e616d696353747265616d4944547479706512000400005764656661756c74111771100209120001588811113a4f1020543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e23111016011ac441212345678081060080b1315303c4652555d6873777b7e93adb2b7bfc2c4c5cacdf0f3f6fbfc0000000000000101000000000000001e000000000000000000000000000000fe",
+      "read": {
+        "control_port": 50011,
+        "server_port": 50010,
+        "cipher_key": "543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e231"
+      }
+    },
+    {
+      "codec": "alac",
+      "latency_ms": 250,
+      "latency_frames": 11025,
+      "latency_min": 11025,
+      "latency_max": 88200,
+      "control_client_port": 6001,
+      "body": {
+        "streams": [
+          {
+            "audioFormat": 262144,
+            "audioMode": "default",
+            "controlPort": 6001,
+            "ct": 2,
+            "isMedia": true,
+            "latencyMax": 88200,
+            "latencyMin": 11025,
+            "shk": {
+              "$data": "543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e231"
+            },
+            "spf": 352,
+            "sr": 44100,
+            "type": 96,
+            "supportsDynamicStreamID": false,
+            "streamConnectionID": 305419896
+          }
+        ]
+      },
+      "body_bplist": "62706c6973743030d101025773747265616d73a103dd0405060708090a0b0c0d0e0f101112131415161718191a1b1c1d5b617564696f466f726d617459617564696f4d6f64655b636f6e74726f6c506f72745263745769734d656469615a6c6174656e63794d61785a6c6174656e63794d696e5373686b537370665273725f101273747265616d436f6e6e656374696f6e49445f1017737570706f72747344796e616d696353747265616d4944547479706512000400005764656661756c741117711002091200015888112b114f1020543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e23111016011ac441212345678081060080b1315303c4652555d6873777b7e93adb2b7bfc2c4c5cacdf0f3f6fbfc0000000000000101000000000000001e000000000000000000000000000000fe",
+      "read": {
+        "control_port": 50011,
+        "server_port": 50010,
+        "cipher_key": "543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e231"
+      }
+    },
+    {
+      "codec": "alac",
+      "latency_ms": 2000,
+      "latency_frames": 88200,
+      "latency_min": 11025,
+      "latency_max": 88200,
+      "control_client_port": 6001,
+      "body": {
+        "streams": [
+          {
+            "audioFormat": 262144,
+            "audioMode": "default",
+            "controlPort": 6001,
+            "ct": 2,
+            "isMedia": true,
+            "latencyMax": 88200,
+            "latencyMin": 11025,
+            "shk": {
+              "$data": "543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e231"
+            },
+            "spf": 352,
+            "sr": 44100,
+            "type": 96,
+            "supportsDynamicStreamID": false,
+            "streamConnectionID": 305419896
+          }
+        ]
+      },
+      "body_bplist": "62706c6973743030d101025773747265616d73a103dd0405060708090a0b0c0d0e0f101112131415161718191a1b1c1d5b617564696f466f726d617459617564696f4d6f64655b636f6e74726f6c506f72745263745769734d656469615a6c6174656e63794d61785a6c6174656e63794d696e5373686b537370665273725f101273747265616d436f6e6e656374696f6e49445f1017737570706f72747344796e616d696353747265616d4944547479706512000400005764656661756c741117711002091200015888112b114f1020543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e23111016011ac441212345678081060080b1315303c4652555d6873777b7e93adb2b7bfc2c4c5cacdf0f3f6fbfc0000000000000101000000000000001e000000000000000000000000000000fe",
+      "read": {
+        "control_port": 50011,
+        "server_port": 50010,
+        "cipher_key": "543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e231"
+      }
+    },
+    {
+      "codec": "alac",
+      "latency_ms": 2001,
+      "latency_frames": 88244,
+      "latency_min": 11025,
+      "latency_max": 88244,
+      "control_client_port": 6001,
+      "body": {
+        "streams": [
+          {
+            "audioFormat": 262144,
+            "audioMode": "default",
+            "controlPort": 6001,
+            "ct": 2,
+            "isMedia": true,
+            "latencyMax": 88244,
+            "latencyMin": 11025,
+            "shk": {
+              "$data": "543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e231"
+            },
+            "spf": 352,
+            "sr": 44100,
+            "type": 96,
+            "supportsDynamicStreamID": false,
+            "streamConnectionID": 305419896
+          }
+        ]
+      },
+      "body_bplist": "62706c6973743030d101025773747265616d73a103dd0405060708090a0b0c0d0e0f101112131415161718191a1b1c1d5b617564696f466f726d617459617564696f4d6f64655b636f6e74726f6c506f72745263745769734d656469615a6c6174656e63794d61785a6c6174656e63794d696e5373686b537370665273725f101273747265616d436f6e6e656374696f6e49445f1017737570706f72747344796e616d696353747265616d4944547479706512000400005764656661756c7411177110020912000158b4112b114f1020543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e23111016011ac441212345678081060080b1315303c4652555d6873777b7e93adb2b7bfc2c4c5cacdf0f3f6fbfc0000000000000101000000000000001e000000000000000000000000000000fe",
+      "read": {
+        "control_port": 50011,
+        "server_port": 50010,
+        "cipher_key": "543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e231"
+      }
+    },
+    {
+      "codec": "alac",
+      "latency_ms": 5000,
+      "latency_frames": 220500,
+      "latency_min": 11025,
+      "latency_max": 220500,
+      "control_client_port": 6001,
+      "body": {
+        "streams": [
+          {
+            "audioFormat": 262144,
+            "audioMode": "default",
+            "controlPort": 6001,
+            "ct": 2,
+            "isMedia": true,
+            "latencyMax": 220500,
+            "latencyMin": 11025,
+            "shk": {
+              "$data": "543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e231"
+            },
+            "spf": 352,
+            "sr": 44100,
+            "type": 96,
+            "supportsDynamicStreamID": false,
+            "streamConnectionID": 305419896
+          }
+        ]
+      },
+      "body_bplist": "62706c6973743030d101025773747265616d73a103dd0405060708090a0b0c0d0e0f101112131415161718191a1b1c1d5b617564696f466f726d617459617564696f4d6f64655b636f6e74726f6c506f72745263745769734d656469615a6c6174656e63794d61785a6c6174656e63794d696e5373686b537370665273725f101273747265616d436f6e6e656374696f6e49445f1017737570706f72747344796e616d696353747265616d4944547479706512000400005764656661756c741117711002091200035d54112b114f1020543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e23111016011ac441212345678081060080b1315303c4652555d6873777b7e93adb2b7bfc2c4c5cacdf0f3f6fbfc0000000000000101000000000000001e000000000000000000000000000000fe",
+      "read": {
+        "control_port": 50011,
+        "server_port": 50010,
+        "cipher_key": "543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e231"
+      }
+    },
+    {
+      "codec": "pcm",
+      "latency_ms": 100,
+      "latency_frames": 4410,
+      "latency_min": 4410,
+      "latency_max": 88200,
+      "control_client_port": 6001,
+      "body": {
+        "streams": [
+          {
+            "audioFormat": 2048,
+            "audioMode": "default",
+            "controlPort": 6001,
+            "ct": 1,
+            "isMedia": true,
+            "latencyMax": 88200,
+            "latencyMin": 4410,
+            "shk": {
+              "$data": "543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e231"
+            },
+            "spf": 352,
+            "sr": 44100,
+            "type": 96,
+            "supportsDynamicStreamID": false,
+            "streamConnectionID": 305419896
+          }
+        ]
+      },
+      "body_bplist": "62706c6973743030d101025773747265616d73a103dd0405060708090a0b0c0d0e0f101112131415161718191a1b1c1d5b617564696f466f726d617459617564696f4d6f64655b636f6e74726f6c506f72745263745769734d656469615a6c6174656e63794d61785a6c6174656e63794d696e5373686b537370665273725f101273747265616d436f6e6e656374696f6e49445f1017737570706f72747344796e616d696353747265616d494454747970651108005764656661756c74111771100109120001588811113a4f1020543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e23111016011ac441212345678081060080b1315303c4652555d6873777b7e93adb2b5bdc0c2c3c8cbeef1f4f9fa0000000000000101000000000000001e000000000000000000000000000000fc",
+      "read": {
+        "control_port": 50011,
+        "server_port": 50010,
+        "cipher_key": "543170dfa802442ae850589efe62d984a1cd45b093bf0ae21dd626bf7852e231"
+      }
+    }
+  ],
+  "responses": {
+    "ptp": {
+      "plist": {
+        "eventPort": 50001,
+        "timingPort": 0,
+        "timingPeerInfo": {
+          "Addresses": ["192.168.1.155", "fe80::11:22ff:fe33:4455"],
+          "ClockID": 192172642282561006,
+          "ClockPorts": {},
+          "DeviceType": 0,
+          "ID": "0D0D0D0D-0000-4000-8000-000000000004",
+          "SupportsClockPortMatchingOverride": true
+        }
+      },
+      "bplist": "62706c6973743030d3010203040511596576656e74506f72745e74696d696e6750656572496e666f5a74696d696e67506f727411c351d6060708090a0b0c0f101112135941646472657373657357436c6f636b49445a436c6f636b506f7274735a446576696365547970655249445f1021537570706f727473436c6f636b506f72744d61746368696e674f76657272696465a20d0e5d3139322e3136382e312e3135355f1017666538303a3a31313a323266663a666533333a343435351302aabbfffeccddeed010005f102430443044304430442d303030302d343030302d383030302d30303030303030303030303409080f19283336434d55606b6e9295a3bdc6c7c9f000000000000001010000000000000014000000000000000000000000000000f1"
+    },
+    "ptp_signed_clock": {
+      "plist": {
+        "eventPort": 50003,
+        "timingPort": 0,
+        "timingPeerInfo": {
+          "Addresses": ["192.168.1.155"],
+          "ClockID": -960748862324285970,
+          "ID": "0D0D0D0D-0000-4000-8000-000000000004",
+          "SupportsClockPortMatchingOverride": true
+        }
+      },
+      "bplist": "62706c6973743030d301020304050f596576656e74506f72745e74696d696e6750656572496e666f5a74696d696e67506f727411c353d4060708090a0c0d0e5941646472657373657357436c6f636b49445249445f1021537570706f727473436c6f636b506f72744d61746368696e674f76657272696465a10b5d3139322e3136382e312e31353513f2aabbfffeccddee5f102430443044304430442d303030302d343030302d383030302d303030303030303030303034091000080f192833363f495154787a8891b8b900000000000001010000000000000010000000000000000000000000000000bb"
+    },
+    "ntp": {
+      "plist": {
+        "eventPort": 50002,
+        "timingPort": 0
+      },
+      "bplist": "62706c6973743030d201020304596576656e74506f72745a74696d696e67506f727411c3521000080d1722250000000000000101000000000000000500000000000000000000000000000027"
+    },
+    "stream": {
+      "plist": {
+        "streams": [
+          {
+            "audioBufferSize": 8388608,
+            "controlPort": 50011,
+            "dataPort": 50010,
+            "streamID": 1,
+            "type": 96
+          }
+        ]
+      },
+      "bplist": "62706c6973743030d101025773747265616d73a103d50405060708090a0b0c0d5f100f617564696f42756666657253697a655b636f6e74726f6c506f72745864617461506f72745873747265616d49445474797065120080000011c35b11c35a10011060080b131520323e4750555a5d60620000000000000101000000000000000e00000000000000000000000000000064"
+    }
+  }
+}

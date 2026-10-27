@@ -1,0 +1,92 @@
+{
+  "_meta": {
+    "generator": "tools/gen_fixtures.py",
+    "pyatv": "0.18.0",
+    "srptools": "1.0.1"
+  },
+  "levels": [
+    {
+      "pct": 0,
+      "dbfs": -144.0,
+      "dbfs_bits": "c062000000000000",
+      "str": "-144.0",
+      "body": "volume: -144.0"
+    },
+    {
+      "pct": 0.5,
+      "dbfs": -29.85,
+      "dbfs_bits": "c03dd9999999999a",
+      "str": "-29.85",
+      "body": "volume: -29.85"
+    },
+    {
+      "pct": 1,
+      "dbfs": -29.7,
+      "dbfs_bits": "c03db33333333333",
+      "str": "-29.7",
+      "body": "volume: -29.7"
+    },
+    {
+      "pct": 10,
+      "dbfs": -27.0,
+      "dbfs_bits": "c03b000000000000",
+      "str": "-27.0",
+      "body": "volume: -27.0"
+    },
+    {
+      "pct": 33,
+      "dbfs": -20.1,
+      "dbfs_bits": "c03419999999999a",
+      "str": "-20.1",
+      "body": "volume: -20.1"
+    },
+    {
+      "pct": 33.3,
+      "dbfs": -20.01,
+      "dbfs_bits": "c034028f5c28f5c3",
+      "str": "-20.01",
+      "body": "volume: -20.01"
+    },
+    {
+      "pct": 40,
+      "dbfs": -18.0,
+      "dbfs_bits": "c032000000000000",
+      "str": "-18.0",
+      "body": "volume: -18.0"
+    },
+    {
+      "pct": 50,
+      "dbfs": -15.0,
+      "dbfs_bits": "c02e000000000000",
+      "str": "-15.0",
+      "body": "volume: -15.0"
+    },
+    {
+      "pct": 66.7,
+      "dbfs": -9.989999999999998,
+      "dbfs_bits": "c023fae147ae147a",
+      "str": "-9.989999999999998",
+      "body": "volume: -9.989999999999998"
+    },
+    {
+      "pct": 99.9,
+      "dbfs": -0.030000000000001137,
+      "dbfs_bits": "bf9eb851eb852000",
+      "str": "-0.030000000000001137",
+      "body": "volume: -0.030000000000001137"
+    },
+    {
+      "pct": 100,
+      "dbfs": 0.0,
+      "dbfs_bits": "0000000000000000",
+      "str": "0.0",
+      "body": "volume: 0.0"
+    }
+  ],
+  "metadata": {
+    "title": "Windows audio",
+    "artist": "WinPods",
+    "album": "AirPlay",
+    "dmap": "6d6c6974000000336d696e6d0000000d57696e646f777320617564696f6173616c00000007416972506c6179617361720000000757696e506f6473"
+  }
+}
