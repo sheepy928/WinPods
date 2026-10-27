@@ -35,11 +35,17 @@ fn keygen(out_dir: &Path) -> Result<()> {
     fs::create_dir_all(out_dir)?;
     let pair = minisign::KeyPair::generate_encrypted_keypair(Some(password()?))?;
     let pk = pair.pk.to_box()?.to_string();
-    let sk = pair.sk.to_box(Some("WinPods release signing key"))?.to_string();
+    let sk = pair
+        .sk
+        .to_box(Some("WinPods release signing key"))?
+        .to_string();
     let pub_path = out_dir.join("winpods-update.pub");
     let key_path = out_dir.join("winpods-update.key");
     if key_path.exists() {
-        bail!("{} already exists; refusing to overwrite", key_path.display());
+        bail!(
+            "{} already exists; refusing to overwrite",
+            key_path.display()
+        );
     }
     fs::write(&pub_path, &pk)?;
     fs::write(&key_path, &sk)?;
@@ -87,7 +93,11 @@ fn verify(public_key: &str, file: &Path) -> Result<()> {
     let data = fs::read(file)?;
     pk.verify(&data, &signature, false)
         .map_err(|e| anyhow::anyhow!("verification failed: {e}"))?;
-    println!("OK: {} (trusted comment: {})", file.display(), signature.trusted_comment());
+    println!(
+        "OK: {} (trusted comment: {})",
+        file.display(),
+        signature.trusted_comment()
+    );
     Ok(())
 }
 
