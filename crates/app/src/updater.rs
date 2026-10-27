@@ -581,8 +581,9 @@ struct ParsedRelease {
     prerelease: bool,
 }
 
-/// Decode the `releases/latest` JSON. `html_url` is only kept when it is HTTPS (the
-/// UI opens it in the browser); otherwise the repository's releases page is used.
+/// Decode the `releases/latest` JSON. `html_url` comes from unsigned API data and the
+/// UI opens it in the browser, so it is only kept when it is an HTTPS URL on
+/// github.com; otherwise the repository's releases page is used.
 fn parse_release(json: &[u8], repo: &str) -> Result<ParsedRelease, UpdateError> {
     let api: ApiRelease = serde_json::from_slice(json)
         .map_err(|e| UpdateError::Other(format!("unexpected release JSON: {e}")))?;
@@ -591,7 +592,7 @@ fn parse_release(json: &[u8], repo: &str) -> Result<ParsedRelease, UpdateError> 
     })?;
     let html_url = api
         .html_url
-        .filter(|u| u.starts_with("https://"))
+        .filter(|u| u.starts_with("https://github.com/") && !u.contains(char::is_whitespace))
         .unwrap_or_else(|| format!("https://github.com/{repo}/releases/latest"));
     Ok(ParsedRelease {
         release: Release {

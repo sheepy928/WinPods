@@ -74,13 +74,19 @@ pub fn status() -> AutostartStatus {
 /// Refuses (`InvalidInput`) when `exe` lies in the temp folder: a copy opened from a
 /// zip disappears once the zip viewer closes.
 pub fn enable(exe: &Path) -> std::io::Result<()> {
+    enable_guarded(&Keys::real(), exe)
+}
+
+/// The temp-copy guard of [`enable`], separated so tests can exercise it against
+/// throw-away keys and never the real Run key.
+fn enable_guarded(keys: &Keys, exe: &Path) -> std::io::Result<()> {
     if paths::is_in_temp_dir(exe) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "refusing to start a temporary copy with Windows (extract the zip first)",
         ));
     }
-    enable_with(&Keys::real(), exe)
+    enable_with(keys, exe)
 }
 
 /// Remove the Run value (no error if absent).
@@ -550,12 +556,14 @@ mod tests {
     }
 
     #[test]
-    fn public_enable_refuses_temp_copies() {
-        // Checked before any registry access, so this never touches the real key.
+    fn enable_refuses_temp_copies() {
+        // Uses throw-away keys: even if the guard regressed, the real Run key is safe.
+        let t = TestKeys::new();
         let exe = std::env::temp_dir()
             .join("Temp1_WinPods.zip")
             .join("WinPods.exe");
-        let e = enable(&exe).unwrap_err();
+        let e = enable_guarded(&t.keys, &exe).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(t.raw(), None, "nothing may be written for a temp copy");
     }
 }

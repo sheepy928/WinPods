@@ -822,6 +822,8 @@ impl Controller {
                     let spawned = std::process::Command::new(&exe)
                         .arg("--post-update")
                         .arg(std::process::id().to_string())
+                        .arg("--updated-from")
+                        .arg(env!("CARGO_PKG_VERSION"))
                         .spawn();
                     if let Err(err) = spawned {
                         tracing::error!("could not start {}: {err}", exe.display());
