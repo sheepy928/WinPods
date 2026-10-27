@@ -34,6 +34,9 @@ pub struct UiContext {
     pub updated_from: Option<String>,
     /// Engine shutdown hook (blocking, ~8 s max); called once on Quit.
     pub shutdown: Box<dyn FnOnce() + Send>,
+    /// Demo mode (`--demo`): mock engine; never save config, touch the Run key or
+    /// check for updates.
+    pub demo: bool,
 }
 
 /// Run the UI until the user quits. Blocks the calling (main) thread.
