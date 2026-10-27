@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WinPods third-party licenses</title>
+<style>
+body { font-family: "Segoe UI", system-ui, sans-serif; max-width: 960px; margin: 2em auto; padding: 0 1em; color: #1b1b1b; }
+h1 { font-weight: 600; }
+.license { border-top: 1px solid #ddd; margin-top: 2em; padding-top: 1em; }
+.crates { color: #555; font-size: 0.9em; }
+pre { white-space: pre-wrap; background: #f6f6f6; padding: 1em; border-radius: 6px; font-size: 0.85em; }
+</style>
+</head>
+<body>
+<h1>Third-party licenses</h1>
+<p>WinPods is MIT licensed. It includes the following open-source components.</p>
+<ul>
+{{#each overview}}
+  <li><a href="#{{id}}">{{name}}</a> ({{count}})</li>
+{{/each}}
+</ul>
+{{#each licenses}}
+<div class="license" id="{{id}}">
+  <h2>{{name}}</h2>
+  <p class="crates">Used by: {{#each used_by}}{{crate.name}} {{crate.version}}{{#unless @last}}, {{/unless}}{{/each}}</p>
+  <pre>{{text}}</pre>
+</div>
+{{/each}}
+<!-- SLINT_LICENSE -->
+</body>
+</html>
