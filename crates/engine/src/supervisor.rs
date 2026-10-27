@@ -63,6 +63,8 @@ const TICK: Duration = Duration::from_millis(250);
 const DEVICE_EVENT_DEBOUNCE: Duration = Duration::from_millis(250);
 const SCAN_DURATION: Duration = Duration::from_secs(5);
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(8);
+/// How often the stream counters may be logged (only when something happened).
+const STATS_LOG_EVERY: Duration = Duration::from_secs(60);
 /// How long shutdown waits for a cancelled connect attempt (its TEARDOWN included).
 const CONNECT_CANCEL_WAIT: Duration = TEARDOWN_TIMEOUT.saturating_add(Duration::from_secs(1));
 /// How long dropping the runtime waits for blocking-pool jobs (a stuck WASAPI call
@@ -245,6 +247,67 @@ struct Stream {
     ntp: Option<TimingResponder>,
     volume: VolumeWorker,
     started: Instant,
+    stats_log: StatsLog,
+}
+
+/// The stream counters in the log, for tray-only use and bug reports (the window
+/// shows them only while it is open): at most once per [`STATS_LOG_EVERY`] and only
+/// when silence, pauses, trims, resends or send errors went up, plus a summary when
+/// the stream ends.
+struct StatsLog {
+    next_at: Instant,
+    logged: runtime::StreamStats,
+}
+
+impl StatsLog {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_at: now + STATS_LOG_EVERY,
+            logged: runtime::StreamStats::default(),
+        }
+    }
+
+    /// The counters worth a log line now, if any.
+    fn due(&mut self, stats: &runtime::StreamStats, now: Instant) -> bool {
+        if now < self.next_at {
+            return false;
+        }
+        self.next_at = now + STATS_LOG_EVERY;
+        let notable = |s: &runtime::StreamStats| {
+            (
+                s.silence_packets,
+                s.stalls,
+                s.frames_trimmed,
+                s.retransmit_requests,
+                s.retransmitted,
+                s.send_errors,
+            )
+        };
+        let changed = notable(stats) != notable(&self.logged);
+        if changed {
+            self.logged = *stats;
+        }
+        changed
+    }
+}
+
+/// "12m 5s: 90661 packets, 120 silence, 3 pauses, 0 frames trimmed, 2/2 resent,
+/// 0 send errors, ring 4 ms".
+fn stats_summary(stats: &runtime::StreamStats, uptime: Duration) -> String {
+    let secs = uptime.as_secs();
+    format!(
+        "{}m {}s: {} packets, {} silence, {} pauses, {} frames trimmed, {}/{} resent, {} send errors, ring {:.0} ms",
+        secs / 60,
+        secs % 60,
+        stats.packets,
+        stats.silence_packets,
+        stats.stalls,
+        stats.frames_trimmed,
+        stats.retransmitted,
+        stats.retransmit_requests,
+        stats.send_errors,
+        stats.ring_frames as f64 / 44.1,
+    )
 }
 
 /// A connection attempt running as its own task.
@@ -442,6 +505,7 @@ impl Engine {
             }
             self.poll_scan();
             self.step().await;
+            self.log_stats();
             self.publish();
         }
         self.shut_down().await;
@@ -967,6 +1031,7 @@ impl Engine {
             ntp,
             volume,
             started: Instant::now(),
+            stats_log: StatsLog::new(Instant::now()),
         });
         self.state = State::Streaming;
         self.last_error.clear();
@@ -982,9 +1047,26 @@ impl Engine {
         info!("retrying in {delay} s");
     }
 
+    /// See [`StatsLog`].
+    fn log_stats(&mut self) {
+        if let Some(stream) = &mut self.stream {
+            let stats = stream.handle.stats();
+            if stream.stats_log.due(&stats, Instant::now()) {
+                info!(
+                    "stream stats {}",
+                    stats_summary(&stats, stream.started.elapsed())
+                );
+            }
+        }
+    }
+
     async fn stop_stream(&mut self) {
         if let Some(stream) = self.stream.take() {
             self.last_stats = stream.handle.stats();
+            info!(
+                "stream ended after {}",
+                stats_summary(&self.last_stats, stream.started.elapsed())
+            );
             self.consumer = Some(stream.handle.stop());
             // No volume request may follow TEARDOWN, and the worker's session
             // reference must go before the session can be unwrapped.
@@ -1559,6 +1641,51 @@ mod tests {
             assert_eq!(*sent.lock(), vec![10.0, 30.0], "coalesced to the newest");
             worker.stop().await;
         });
+    }
+
+    #[test]
+    fn stats_are_logged_once_a_minute_and_only_when_something_happened() {
+        let start = Instant::now();
+        let mut log = StatsLog::new(start);
+        let mut stats = runtime::StreamStats {
+            packets: 125,
+            anchors: 1,
+            ..Default::default()
+        };
+        assert!(
+            !log.due(&stats, start + Duration::from_secs(30)),
+            "too early"
+        );
+        stats.packets = 7500;
+        stats.anchors = 60;
+        let minute = start + STATS_LOG_EVERY;
+        assert!(
+            !log.due(&stats, minute),
+            "packets and anchors alone are routine"
+        );
+        stats.stalls = 1;
+        stats.silence_packets = 40;
+        assert!(
+            !log.due(&stats, minute + Duration::from_secs(1)),
+            "at most once a minute"
+        );
+        assert!(
+            log.due(&stats, minute + STATS_LOG_EVERY),
+            "a pause is logged"
+        );
+        assert!(
+            !log.due(&stats, minute + 2 * STATS_LOG_EVERY),
+            "nothing new since the last line"
+        );
+        stats.retransmit_requests = 2;
+        stats.retransmitted = 2;
+        assert!(log.due(&stats, minute + 3 * STATS_LOG_EVERY));
+
+        stats.ring_frames = 176;
+        assert_eq!(
+            stats_summary(&stats, Duration::from_secs(725)),
+            "12m 5s: 7500 packets, 40 silence, 1 pauses, 0 frames trimmed, 2/2 resent, 0 send errors, ring 4 ms"
+        );
     }
 
     #[test]
