@@ -1,6 +1,7 @@
 // Settings page: speaker address + Find popup, startup, updates, advanced, about.
 
-import { AboutSlint, Button, ComboBox, LineEdit, ScrollView, Spinner, TextEdit } from "std-widgets.slint";
+import { AboutSlint, LineEdit, ScrollView, Spinner, TextEdit } from "std-widgets.slint";
+import { DropDown, PushButton } from "widgets.slint";
 import { App, ScanRow } from "state.slint";
 import { Theme, Icons } from "theme.slint";
 import { Card, CardFrame, Caption, IconButton, InfoBar, Link, SectionTitle, SettingRow, SoftShadow, SwitchRow } from "controls.slint";
@@ -90,7 +91,7 @@ export component SettingsPage inherits Rectangle {
                         }
                         VerticalLayout {
                             alignment: center;
-                            find-button := Button {
+                            find-button := PushButton {
                                 text: "Find…";
                                 accessible-label: "Find speakers on the network";
                                 clicked => {
@@ -123,7 +124,7 @@ export component SettingsPage inherits Rectangle {
             if App.autostart-other-copy: SettingRow {
                 title: "Another copy starts with Windows";
                 description: "Start this copy at sign-in instead";
-                Button {
+                PushButton {
                     text: "Use this copy";
                     clicked => {
                         App.use-this-copy();
@@ -164,7 +165,7 @@ export component SettingsPage inherits Rectangle {
                 title: "Check for updates";
                 description: App.update-status;
                 enabled: App.updates-supported;
-                Button {
+                PushButton {
                     text: "Check now";
                     enabled: App.updates-supported && !App.update-busy;
                     clicked => {
@@ -175,14 +176,14 @@ export component SettingsPage inherits Rectangle {
             if App.update-available || App.update-error != "": InfoBar {
                 title: App.update-available ? "WinPods " + App.update-version + " is available" : "WinPods update";
                 message: App.update-busy ? App.update-status : App.update-error != "" ? (App.update-available ? App.update-error + (App.update-can-install ? " Try again." : " Download the new version from the release page.") : App.update-error) : App.update-can-install ? "Downloads, verifies the signature and restarts WinPods." + (App.connect-on ? " Streaming resumes automatically." : "") : "Download the new version from the release page.";
-                if App.update-available: Button {
+                if App.update-available: PushButton {
                     text: "Skip this version";
                     enabled: !App.update-busy;
                     clicked => {
                         App.skip-update();
                     }
                 }
-                if App.update-available: Button {
+                if App.update-available: PushButton {
                     text: App.update-can-install ? "Install & restart" : "Open release page";
                     primary: true;
                     enabled: !App.update-busy;
@@ -190,7 +191,7 @@ export component SettingsPage inherits Rectangle {
                         App.install-update();
                     }
                 }
-                if !App.update-available: Button {
+                if !App.update-available: PushButton {
                     text: "Dismiss";
                     clicked => {
                         App.dismiss-update-error();
@@ -205,7 +206,7 @@ export component SettingsPage inherits Rectangle {
             SettingRow {
                 title: "Clock";
                 description: "PTP for HomePods, NTP for older speakers";
-                ComboBox {
+                DropDown {
                     width: 120px;
                     model: ["PTP", "NTP"];
                     current-index <=> App.clock-index;
@@ -218,7 +219,7 @@ export component SettingsPage inherits Rectangle {
             SettingRow {
                 title: "Codec";
                 description: "HomePods expect ALAC";
-                ComboBox {
+                DropDown {
                     width: 120px;
                     model: ["ALAC", "PCM"];
                     current-index <=> App.codec-index;
@@ -230,8 +231,8 @@ export component SettingsPage inherits Rectangle {
             }
             SettingRow {
                 title: "Renderer";
-                description: "GPU needs about 100 MB more memory (after restart)";
-                ComboBox {
+                description: "Applies after a restart; GPU uses 100 MB more";
+                DropDown {
                     width: 120px;
                     model: ["Software", "GPU"];
                     current-index <=> App.renderer-index;
@@ -244,7 +245,7 @@ export component SettingsPage inherits Rectangle {
             SettingRow {
                 title: "Log level";
                 description: "Applies after a restart";
-                ComboBox {
+                DropDown {
                     width: 120px;
                     model: ["Debug", "Info", "Warning", "Error"];
                     current-index <=> App.log-level-index;
@@ -257,7 +258,7 @@ export component SettingsPage inherits Rectangle {
             SettingRow {
                 title: "Log files";
                 description: "winpods.log in %APPDATA%\\WinPods";
-                Button {
+                PushButton {
                     text: "Open log folder";
                     clicked => {
                         App.open-log-folder();
@@ -315,7 +316,7 @@ export component SettingsPage inherits Rectangle {
             SettingRow {
                 title: "Third-party licenses";
                 description: "Open-source components used by WinPods";
-                Button {
+                PushButton {
                     text: root.show-licenses ? "Hide" : "Show";
                     clicked => {
                         root.show-licenses = !root.show-licenses;
@@ -411,14 +412,14 @@ export component SettingsPage inherits Rectangle {
                 HorizontalLayout {
                     alignment: end;
                     spacing: 8px;
-                    Button {
+                    PushButton {
                         text: "Search again";
                         enabled: !App.scan-running;
                         clicked => {
                             App.find-speakers();
                         }
                     }
-                    Button {
+                    PushButton {
                         text: "Close";
                         clicked => {
                             find-popup.close();

@@ -1,0 +1,412 @@
+// Push button and drop-down in the Windows 11 (Fluent) look, used instead of
+// std-widgets' Button and ComboBox.
+//
+// They are drawn only from shapes that the software renderer (the default) draws
+// exactly like the GPU one: solid fills and solid strokes, no gradients and no drop
+// shadows. The std widgets outline themselves with vertical gradients (a darker bottom
+// edge in light mode, a lighter top edge in dark mode) and give the open list a drop
+// shadow; the software renderer draws neither. Here the outline is a solid stroke plus
+// one solid edge line, and the list's shadow is a SoftShadow. Colours follow Fluent.
+
+import { ScrollView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { SoftShadow } from "controls.slint";
+
+// Fluent colours that Theme does not already have.
+global Fluent {
+    out property <brush> control-fill: Theme.dark ? #ffffff0f : #ffffffb3;
+    out property <brush> control-fill-hover: Theme.dark ? #ffffff14 : #f9f9f980;
+    out property <brush> control-fill-pressed: Theme.dark ? #ffffff08 : #f9f9f94d;
+    out property <brush> control-fill-disabled: Theme.dark ? #ffffff0a : #f9f9f94d;
+    out property <brush> field-fill-pressed: Theme.dark ? #ffffff0a : #0000000f;
+    out property <brush> accent-disabled: Theme.dark ? #ffffff29 : #00000038;
+    // Uniform stroke of pressed and disabled controls.
+    out property <brush> strong-stroke: Theme.dark ? #ffffff14 : #00000073;
+    out property <brush> text: Theme.dark ? #ffffff : #000000e6;
+    out property <brush> text-secondary: Theme.dark ? #ffffffc9 : #00000099;
+    out property <brush> text-tertiary: Theme.dark ? #ffffff8a : #00000073;
+    out property <brush> text-disabled: Theme.dark ? #ffffff5e : #0000005e;
+    out property <brush> accent-text-pressed: Theme.dark ? #00000080 : #ffffffb3;
+    out property <brush> accent-text-disabled: Theme.dark ? #ffffff87 : #ffffff;
+    out property <brush> list-fill: Theme.dark ? #2c2c2c : #f0f0f0;
+    out property <brush> list-stroke: Theme.dark ? #00000033 : #0000000f;
+    out property <brush> row-fill: Theme.dark ? #ffffff0f : #0000000a;
+    out property <brush> row-fill-strong: Theme.dark ? #ffffff0a : #00000005;
+}
+
+// Keyboard focus ring: two strokes, like Fluent's.
+component FocusRing inherits Rectangle {
+    border-width: 2px;
+    border-color: Theme.dark ? #ffffff : #000000e6;
+    Rectangle {
+        x: 2px;
+        y: 2px;
+        width: parent.width - 4px;
+        height: parent.height - 4px;
+        border-width: 1px;
+        border-radius: max(0px, parent.border-radius - 2px);
+        border-color: Theme.dark ? #000000b3 : #ffffff;
+    }
+}
+
+// Fluent's gradient outline as a solid stroke plus one solid line along the edge that
+// the gradient darkens (bottom) or lightens (top, dark mode). Pressed and disabled
+// controls have a uniform stroke instead (`uniform` with `uniform-color`), as in Fluent.
+component ControlOutline inherits Rectangle {
+    in property <bool> accent;
+    in property <bool> uniform;
+    in property <brush> uniform-color: Fluent.strong-stroke;
+    property <bool> top-edge: Theme.dark && !root.accent;
+    border-width: 1px;
+    border-color: root.uniform ? root.uniform-color : root.accent ? #ffffff14 : Theme.dark ? #00000012 : #0000000f;
+    animate border-color { duration: 150ms; }
+    Rectangle {
+        visible: !root.uniform;
+        x: root.border-radius;
+        y: root.top-edge ? 0 : root.height - 1px;
+        width: max(0px, root.width - 2 * root.border-radius);
+        height: 1px;
+        background: root.accent ? (Theme.dark ? #00000020 : #0000004d) : Theme.dark ? #ffffff14 : #00000017;
+    }
+}
+
+export component PushButton {
+    in property <string> text;
+    // Accent-coloured (the default action of a dialog or banner).
+    in property <bool> primary;
+    in property <bool> enabled: true;
+    out property <bool> has-focus: keys.has-focus;
+    out property <bool> pressed: root.enabled && touch.pressed;
+    callback clicked();
+
+    property <brush> text-color: !root.enabled ? (root.primary ? Fluent.accent-text-disabled : Fluent.text-disabled) : root.pressed ? (root.primary ? Fluent.accent-text-pressed : Fluent.text-secondary) : root.primary ? Theme.accent-foreground : Fluent.text;
+
+    min-width: max(32px, layout.min-width);
+    min-height: max(32px, layout.min-height);
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    forward-focus: keys;
+    accessible-role: button;
+    accessible-enabled: root.enabled;
+    accessible-label: root.text;
+    accessible-action-default => {
+        if root.enabled {
+            root.clicked();
+        }
+    }
+
+    fill := Rectangle {
+        border-radius: 4px;
+        background: !root.enabled ? (root.primary ? Fluent.accent-disabled : Fluent.control-fill-disabled) : root.pressed ? (root.primary ? Theme.accent.with-alpha(0.8) : Fluent.control-fill-pressed) : touch.has-hover ? (root.primary ? Theme.accent.with-alpha(0.9) : Fluent.control-fill-hover) : root.primary ? Theme.accent : Fluent.control-fill;
+        animate background { duration: 150ms; }
+    }
+
+    ControlOutline {
+        border-radius: fill.border-radius;
+        accent: root.primary;
+        uniform: !root.enabled || root.pressed;
+        // A disabled accent button has no outline at all.
+        visible: root.enabled || !root.primary;
+    }
+
+    layout := HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        padding-top: 5px;
+        padding-bottom: 5px;
+        alignment: center;
+        Text {
+            text: root.text;
+            color: root.text-color;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            accessible-role: none;
+            animate color { duration: 150ms; }
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            root.clicked();
+        }
+    }
+
+    // Keyboard only (zero width): a click does not move the focus, as in Fluent.
+    keys := FocusScope {
+        x: 0;
+        width: 0;
+        enabled: root.enabled;
+        key-pressed(event) => {
+            // A button disabled while it has the focus keeps it, but must not react.
+            if !root.enabled {
+                return reject;
+            }
+            if event.text == Key.Space || event.text == Key.Return {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+
+    if root.has-focus && root.enabled: FocusRing {
+        border-radius: fill.border-radius;
+    }
+}
+
+// One row of the open list.
+component ListRow {
+    in property <string> text;
+    in property <bool> is-selected;
+    // Under the pointer, or reached with the arrow keys.
+    in property <bool> highlighted;
+    in property <bool> pressed;
+    height: 40px;
+    accessible-role: list-item;
+    accessible-label: root.text;
+    accessible-item-selectable: true;
+    accessible-item-selected: root.is-selected;
+
+    Rectangle {
+        width: root.width - 6px;
+        height: root.height - 4px;
+        border-radius: 4px;
+        background: root.pressed ? (root.is-selected ? Fluent.row-fill : Fluent.row-fill-strong) : root.highlighted ? (root.is-selected ? Fluent.row-fill-strong : Fluent.row-fill) : root.is-selected ? Fluent.row-fill : transparent;
+
+        HorizontalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            Text {
+                text: root.text;
+                color: root.highlighted && !root.pressed ? Fluent.text-secondary : Fluent.text;
+                vertical-alignment: center;
+                overflow: elide;
+                accessible-role: none;
+            }
+        }
+
+        // The accent pill marking the current choice.
+        Rectangle {
+            x: 0;
+            width: 3px;
+            height: root.is-selected ? 16px : 0;
+            y: (parent.height - self.height) / 2;
+            border-radius: 2px;
+            background: Theme.accent;
+        }
+    }
+
+    // The row's TouchArea.
+    @children
+}
+
+export component DropDown {
+    in property <[string]> model;
+    in property <bool> enabled: true;
+    in-out property <int> current-index: 0;
+    out property <string> current-value: root.current-index >= 0 && root.current-index < root.model.length ? root.model[root.current-index] : "";
+    out property <bool> has-focus: (keys.has-focus || root.open) && root.enabled;
+    // A choice was made (click, Return in the list, or an arrow key on the closed box).
+    callback selected(value: string);
+    // The list has just opened (once per opening: click, Return/Space, screen reader).
+    callback opened();
+
+    // The list is open (its focus scope has the focus).
+    property <bool> open;
+    // Row the arrow keys are on while the list is open; Return chooses it.
+    property <int> highlight;
+    property <length> row-height: 40px;
+    property <length> list-padding: 4px;
+    property <int> visible-rows: min(6, root.model.length);
+
+    min-width: max(160px, layout.min-width);
+    min-height: max(32px, layout.min-height);
+    horizontal-stretch: 1;
+    vertical-stretch: 0;
+    forward-focus: keys;
+    accessible-role: combobox;
+    accessible-enabled: root.enabled;
+    accessible-expandable: true;
+    accessible-expanded: root.open;
+    accessible-value: root.current-value;
+    accessible-action-expand => {
+        root.show-list();
+    }
+
+    function choose(index: int) {
+        if !root.enabled || index < 0 || index >= root.model.length {
+            return;
+        }
+        root.current-index = index;
+        root.selected(root.current-value);
+    }
+
+    function show-list() {
+        if !root.enabled {
+            return;
+        }
+        root.highlight = root.current-index;
+        list.show();
+        root.opened();
+    }
+
+    // Keep the index inside a model that shrank (the source list after a refresh).
+    changed model => {
+        if root.model.length > 0 && root.current-index >= root.model.length {
+            root.current-index = root.model.length - 1;
+        }
+        if root.highlight >= root.model.length {
+            root.highlight = max(0, root.model.length - 1);
+        }
+    }
+
+    field := Rectangle {
+        border-radius: 3px;
+        background: !root.enabled ? Fluent.control-fill-disabled : touch.pressed ? Fluent.field-fill-pressed : touch.has-hover ? Fluent.control-fill-hover : Fluent.control-fill;
+        animate background { duration: 150ms; }
+    }
+
+    ControlOutline {
+        border-radius: field.border-radius;
+        uniform: !root.enabled || touch.pressed;
+    }
+
+    layout := HorizontalLayout {
+        padding-left: 11px;
+        padding-right: 11px;
+        spacing: 8px;
+        Text {
+            horizontal-stretch: 1;
+            vertical-alignment: center;
+            text: root.current-value;
+            color: !root.enabled ? Fluent.text-disabled : touch.pressed ? Fluent.text-secondary : Fluent.text;
+            overflow: elide;
+            accessible-role: none;
+        }
+        // Fluent's chevron (12x12 artwork; the arrow fills its top 7 px).
+        Rectangle {
+            width: 12px;
+            Path {
+                x: 0;
+                y: (parent.height - self.height) / 2 + 1px;
+                width: 12px;
+                height: 7px;
+                viewbox-width: 12;
+                viewbox-height: 7;
+                commands: "M11.85 0.65 C12.05 0.84 12.05 1.16 11.85 1.35 L6.39 6.84 C6.17 7.05 5.82 7.05 5.61 6.84 L0.14 1.35 C-0.05 1.16 -0.05 0.84 0.15 0.65 C0.34 0.45 0.66 0.45 0.85 0.65 L6 5.81 L11.15 0.65 C11.34 0.45 11.66 0.45 11.85 0.65 Z";
+                fill: !root.enabled ? Fluent.text-disabled : touch.pressed ? Fluent.text-tertiary : Fluent.text-secondary;
+                stroke: transparent;
+                accessible-role: none;
+            }
+        }
+    }
+
+    keys := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if !root.enabled {
+                return reject;
+            }
+            if event.text == Key.UpArrow {
+                root.choose(max(0, root.current-index - 1));
+                return accept;
+            }
+            if event.text == Key.DownArrow {
+                root.choose(min(root.model.length - 1, root.current-index + 1));
+                return accept;
+            }
+            if event.text == Key.Return || event.text == Key.Space {
+                root.show-list();
+                return accept;
+            }
+            reject
+        }
+
+        // Inside the focus scope: one on top would take the first click for itself
+        // (to get the focus) and the list would not open. The wheel is left to the
+        // page: scrolling past a focused box must not change it.
+        touch := TouchArea {
+            enabled: root.enabled;
+            clicked => {
+                keys.focus();
+                root.show-list();
+            }
+        }
+    }
+
+    if root.has-focus: FocusRing {
+        border-radius: field.border-radius;
+    }
+
+    list := PopupWindow {
+        x: 0;
+        // The first row sits over the box, as in Fluent.
+        y: -root.list-padding;
+        width: root.width;
+        height: root.visible-rows * root.row-height + 2 * root.list-padding;
+        close-policy: close-on-click-outside;
+        forward-focus: list-focus;
+
+        SoftShadow {
+            width: parent.width;
+            height: parent.height;
+            radius: 7px;
+            offset-y: 6px;
+            strength: Theme.dark ? 0.45 : 0.2;
+        }
+        Rectangle {
+            border-radius: 7px;
+            background: Fluent.list-fill;
+            border-width: 1px;
+            border-color: Fluent.list-stroke;
+        }
+
+        list-focus := FocusScope {
+            focus-changed-event => {
+                root.open = self.has-focus;
+            }
+            key-pressed(event) => {
+                if event.text == Key.UpArrow {
+                    root.highlight = max(0, root.highlight - 1);
+                    return accept;
+                }
+                if event.text == Key.DownArrow {
+                    root.highlight = min(root.model.length - 1, root.highlight + 1);
+                    return accept;
+                }
+                if event.text == Key.Return || event.text == Key.Space {
+                    root.choose(root.highlight);
+                    list.close();
+                    return accept;
+                }
+                if event.text == Key.Escape {
+                    list.close();
+                    return accept;
+                }
+                reject
+            }
+
+            ScrollView {
+                // Keeps the highlighted row in view.
+                content-y: -max(0, root.highlight - root.visible-rows + 1) * root.row-height;
+                VerticalLayout {
+                    alignment: start;
+                    padding: root.list-padding;
+                    for value[index] in root.model: ListRow {
+                        text: value;
+                        is-selected: index == root.current-index;
+                        highlighted: row-touch.has-hover || (index == root.highlight && index != root.current-index);
+                        pressed: row-touch.pressed;
+                        row-touch := TouchArea {
+                            clicked => {
+                                root.choose(index);
+                                list.close();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

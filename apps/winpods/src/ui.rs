@@ -2480,6 +2480,75 @@ mod tests {
             assert!(below[0] < 245, "shadow below {below:?}");
             assert!(near(rgb(&px, 250, 20), WHITE));
         }
+
+        #[allow(clippy::all, clippy::pedantic, missing_docs, unused_qualifications)]
+        mod widgets_harness {
+            slint::slint! {
+                #[style = "fluent"]
+                import { DropDown, PushButton } from "../ui/widgets.slint";
+
+                export component Widgets inherits Window {
+                    width: 420px;
+                    height: 140px;
+                    background: #ffffff;
+                    PushButton {
+                        x: 20px;
+                        y: 20px;
+                        width: 100px;
+                        height: 32px;
+                        text: "";
+                    }
+                    DropDown {
+                        x: 200px;
+                        y: 20px;
+                        width: 200px;
+                        model: ["One", "Two"];
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn button_outline_edge_and_list_shadow() {
+            use slint::LogicalPosition;
+            use slint::platform::{PointerEventButton, WindowEvent};
+
+            let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+            slint::platform::set_platform(Box::new(HeadlessPlatform(window.clone())))
+                .expect("a fresh test thread has no Slint platform yet");
+            let ui = widgets_harness::Widgets::new().unwrap();
+            ui.show().unwrap();
+            window.set_size(PhysicalSize::new(W as u32, H as u32));
+            ui.window()
+                .dispatch_event(WindowEvent::WindowActiveChanged(true));
+
+            // Button (x 20..120, y 20..52): Fluent's light outline is darker along the
+            // bottom edge than along the top.
+            let px = render(&window);
+            let top = rgb(&px, 70, 20);
+            let bottom = rgb(&px, 70, 51);
+            assert!(bottom[0] + 8 < top[0], "bottom {bottom:?} vs top {top:?}");
+            assert!(top[0] < 255, "the top edge is outlined too: {top:?}");
+
+            // Below the closed list there is nothing but the window.
+            let below = (300, 120);
+            assert!(near(rgb(&px, below.0, below.1), WHITE));
+
+            // Open it: the list (y 16..104 for two rows) casts a shadow below it.
+            let position = LogicalPosition::new(300.0, 36.0);
+            let button = PointerEventButton::Left;
+            ui.window()
+                .dispatch_event(WindowEvent::PointerMoved { position });
+            ui.window()
+                .dispatch_event(WindowEvent::PointerPressed { position, button });
+            ui.window()
+                .dispatch_event(WindowEvent::PointerReleased { position, button });
+            slint::platform::update_timers_and_animations();
+            let px = render(&window);
+            let shadow = rgb(&px, 300, 108);
+            assert!(shadow[0] < 250, "shadow below the open list: {shadow:?}");
+            assert!(near(rgb(&px, below.0, below.1 + 15), WHITE));
+        }
     }
 
     /// The custom-latency box on the main page: driven with real pointer and key
@@ -2669,10 +2738,11 @@ mod tests {
         }
     }
 
-    /// The main page's Source list asks for a device refresh each time it opens
-    /// (`opened` -> `App.refresh-sources()`): driven with real pointer and key events
-    /// in a headless window (software renderer, no screen).
-    mod open_aware_combo_box {
+    /// The project's DropDown and PushButton (widgets.slint), driven with real pointer
+    /// and key events in a headless window (software renderer, no screen). The main
+    /// page's Source list asks for a device refresh each time it opens (`opened` ->
+    /// `App.refresh-sources()`).
+    mod drop_down_and_push_button {
         use std::rc::Rc;
 
         use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
@@ -2683,21 +2753,27 @@ mod tests {
         mod harness {
             slint::slint! {
                 #[style = "fluent"]
-                import { OpenAwareComboBox } from "../ui/open-aware-combo-box.slint";
+                import { DropDown, PushButton } from "../ui/widgets.slint";
 
                 export component Harness inherits Window {
                     width: 300px;
                     height: 400px;
                     in-out property <[string]> sources: ["Speakers", "Headphones"];
                     in-out property <int> index;
+                    in property <bool> combo-enabled: true;
+                    in property <bool> button-enabled: true;
                     out property <int> opened;
                     out property <int> picked: -1;
+                    out property <int> selections;
+                    out property <int> clicks;
                     out property <bool> focused: combo.has-focus;
                     out property <bool> expanded: combo.accessible-expanded;
-                    combo := OpenAwareComboBox {
+                    out property <bool> button-focused: button.has-focus;
+                    combo := DropDown {
                         x: 10px;
                         y: 10px;
                         width: 200px;
+                        enabled: root.combo-enabled;
                         model: root.sources;
                         current-index <=> root.index;
                         opened => {
@@ -2705,6 +2781,16 @@ mod tests {
                         }
                         selected => {
                             root.picked = self.current-index;
+                            root.selections += 1;
+                        }
+                    }
+                    button := PushButton {
+                        x: 220px;
+                        y: 10px;
+                        text: "Go";
+                        enabled: root.button-enabled;
+                        clicked => {
+                            root.clicks += 1;
                         }
                     }
                     // Something else that takes focus when clicked.
@@ -2732,13 +2818,26 @@ mod tests {
         }
 
         impl Driver {
+            fn new() -> Driver {
+                let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+                slint::platform::set_platform(Box::new(HeadlessPlatform(window.clone())))
+                    .expect("a fresh test thread has no Slint platform yet");
+                let ui = Harness::new().unwrap();
+                ui.show().unwrap();
+                window.set_size(PhysicalSize::new(300, 400));
+                // As a real window is when the user clicks into it.
+                ui.window()
+                    .dispatch_event(WindowEvent::WindowActiveChanged(true));
+                Driver { ui }
+            }
+
             fn send(&self, event: WindowEvent) {
                 self.ui.window().dispatch_event(event);
                 // Runs the `changed` handlers, as each event-loop iteration does.
                 slint::platform::update_timers_and_animations();
             }
 
-            fn click(&self, x: f32, y: f32) {
+            fn click(&self, (x, y): (f32, f32)) {
                 let position = LogicalPosition::new(x, y);
                 self.send(WindowEvent::PointerMoved { position });
                 let button = PointerEventButton::Left;
@@ -2746,91 +2845,195 @@ mod tests {
                 self.send(WindowEvent::PointerReleased { position, button });
             }
 
-            fn key(&self, text: slint::SharedString) {
+            fn key(&self, key: Key) {
+                let text: slint::SharedString = key.into();
                 self.send(WindowEvent::KeyPressed { text: text.clone() });
                 self.send(WindowEvent::KeyReleased { text });
             }
+
+            fn wheel(&self, (x, y): (f32, f32), delta_y: f32) {
+                let position = LogicalPosition::new(x, y);
+                self.send(WindowEvent::PointerMoved { position });
+                self.send(WindowEvent::PointerScrolled {
+                    position,
+                    delta_x: 0.0,
+                    delta_y,
+                });
+            }
+
+            fn set_sources(&self, names: &[&str]) {
+                let rows: Vec<slint::SharedString> = names.iter().map(|n| (*n).into()).collect();
+                self.ui
+                    .set_sources(slint::ModelRc::new(slint::VecModel::from(rows)));
+                slint::platform::update_timers_and_animations();
+            }
+        }
+
+        // The closed box spans x 10..210, y 10..42; the open list covers it, one 40px
+        // row per entry starting at y 10.
+        const COMBO: (f32, f32) = (100.0, 26.0);
+        const OUTSIDE: (f32, f32) = (250.0, 380.0);
+        const OTHER_FOCUSABLE: (f32, f32) = (50.0, 320.0);
+        const BUTTON: (f32, f32) = (240.0, 26.0);
+
+        fn row(i: f32) -> (f32, f32) {
+            (100.0, 30.0 + 40.0 * i)
         }
 
         #[test]
         fn opened_fires_on_every_opening_whatever_closed_the_list() {
-            let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
-            slint::platform::set_platform(Box::new(HeadlessPlatform(window.clone())))
-                .expect("a fresh test thread has no Slint platform yet");
-            let ui = Harness::new().unwrap();
-            ui.show().unwrap();
-            window.set_size(PhysicalSize::new(300, 400));
-            let d = Driver { ui };
+            let d = Driver::new();
             let ui = &d.ui;
 
-            // The closed box spans x 10..210, y 10..42; the open list covers it, one
-            // 40px row per entry starting at y 10.
-            let combo = (100.0, 26.0);
-            let row = |i: f32| (100.0, 30.0 + 40.0 * i);
-            let outside = (250.0, 380.0);
-            let other_focusable = (50.0, 320.0);
-
             // Focus alone (Tab) is not an opening.
-            d.key(Key::Tab.into());
+            d.key(Key::Tab);
             assert!(ui.get_focused());
             assert_eq!(ui.get_opened(), 0);
 
             // First opening, closed with Escape: the box keeps focus.
-            d.click(combo.0, combo.1);
+            d.click(COMBO);
             assert!(ui.get_expanded());
             assert_eq!(ui.get_opened(), 1);
-            d.key(Key::Escape.into());
+            d.key(Key::Escape);
             assert!(!ui.get_expanded());
             assert!(ui.get_focused());
 
-            // Reopened (still focused, which a has-focus rule misses), then closed by a
-            // click outside on something that takes no focus.
-            d.click(combo.0, combo.1);
+            // Reopened (still focused), then closed by a click outside on something
+            // that takes no focus.
+            d.click(COMBO);
             assert!(ui.get_expanded());
             assert_eq!(ui.get_opened(), 2);
-            d.click(outside.0, outside.1);
+            d.click(OUTSIDE);
             assert!(!ui.get_expanded());
             assert!(ui.get_focused());
 
             // Reopened; the refreshed device list arrives while it is open (as the
             // engine's answer to `refresh-sources` does) and its new row can be picked.
-            d.click(combo.0, combo.1);
+            d.click(COMBO);
             assert_eq!(ui.get_opened(), 3);
-            ui.set_sources(slint::ModelRc::new(slint::VecModel::from(vec![
-                slint::SharedString::from("Speakers"),
-                slint::SharedString::from("Headphones"),
-                slint::SharedString::from("USB headset"),
-            ])));
-            slint::platform::update_timers_and_animations();
+            d.set_sources(&["Speakers", "Headphones", "USB headset"]);
             assert!(ui.get_expanded(), "a new list does not close the popup");
-            d.click(row(2.0).0, row(2.0).1);
+            d.click(row(2.0));
             assert!(!ui.get_expanded());
             assert_eq!(ui.get_picked(), 2);
             assert_eq!(ui.get_index(), 2);
             assert!(ui.get_focused());
 
-            // Reopened after picking a row.
-            d.click(combo.0, combo.1);
+            // Reopened after picking a row; Return keeps the current row.
+            d.click(COMBO);
             assert_eq!(ui.get_opened(), 4);
-            d.key(Key::Return.into());
+            d.key(Key::Return);
             assert!(!ui.get_expanded());
+            assert_eq!(ui.get_index(), 2);
 
-            // Opened from the keyboard.
-            d.key(Key::Return.into());
+            // Opened from the keyboard (Return or Space on the focused box).
+            d.key(Key::Return);
             assert!(ui.get_expanded());
             assert_eq!(ui.get_opened(), 5);
-            d.key(Key::Escape.into());
+            d.key(Key::Escape);
+            d.key(Key::Space);
+            assert!(ui.get_expanded());
+            assert_eq!(ui.get_opened(), 6);
+            d.key(Key::Escape);
 
             // Focus moving away and back (another control, the window losing and
             // regaining activation) is not an opening either.
-            d.click(other_focusable.0, other_focusable.1);
+            d.click(OTHER_FOCUSABLE);
             assert!(!ui.get_focused());
             d.send(WindowEvent::WindowActiveChanged(false));
             d.send(WindowEvent::WindowActiveChanged(true));
-            d.key(Key::Tab.into());
-            assert_eq!(ui.get_opened(), 5);
-            d.click(combo.0, combo.1);
+            d.key(Key::Tab);
             assert_eq!(ui.get_opened(), 6);
+            d.click(COMBO);
+            assert_eq!(ui.get_opened(), 7);
+        }
+
+        #[test]
+        fn arrow_keys_browse_the_open_list_and_only_return_chooses() {
+            let d = Driver::new();
+            let ui = &d.ui;
+            d.set_sources(&["Default", "Speakers", "Headphones", "Cable"]);
+
+            // The first click on a box without focus opens it.
+            d.click(COMBO);
+            assert!(ui.get_expanded());
+            assert_eq!(ui.get_opened(), 1);
+            // Browsing the open list chooses nothing (no capture restart per step).
+            d.key(Key::DownArrow);
+            d.key(Key::DownArrow);
+            assert_eq!(ui.get_selections(), 0);
+            assert_eq!(ui.get_index(), 0);
+            // Escape leaves the choice as it was.
+            d.key(Key::Escape);
+            assert!(!ui.get_expanded());
+            assert_eq!(ui.get_index(), 0);
+            assert_eq!(ui.get_selections(), 0);
+
+            // Return chooses the row the arrows are on, once.
+            d.key(Key::Return);
+            d.key(Key::DownArrow);
+            d.key(Key::DownArrow);
+            d.key(Key::DownArrow);
+            d.key(Key::DownArrow); // stops at the last row
+            d.key(Key::UpArrow);
+            d.key(Key::Return);
+            assert!(!ui.get_expanded());
+            assert_eq!(ui.get_index(), 2);
+            assert_eq!(ui.get_picked(), 2);
+            assert_eq!(ui.get_selections(), 1);
+
+            // On the closed box the arrows choose directly, within the list.
+            d.key(Key::UpArrow);
+            assert_eq!(ui.get_index(), 1);
+            d.key(Key::DownArrow);
+            d.key(Key::DownArrow);
+            d.key(Key::DownArrow);
+            assert_eq!(ui.get_index(), 3);
+            assert_eq!(ui.get_selections(), 5);
+
+            // The wheel over the focused, closed box scrolls the page, not the choice.
+            d.wheel(COMBO, 40.0);
+            d.wheel(COMBO, -40.0);
+            assert_eq!(ui.get_index(), 3);
+            assert_eq!(ui.get_selections(), 5);
+
+            // A shorter list keeps the index inside it.
+            d.set_sources(&["Default", "Speakers"]);
+            assert_eq!(ui.get_index(), 1);
+
+            // Disabled: neither clicks nor keys open or change it.
+            ui.set_combo_enabled(false);
+            d.click(COMBO);
+            d.key(Key::Return);
+            d.key(Key::UpArrow);
+            assert!(!ui.get_expanded());
+            assert_eq!(ui.get_opened(), 2);
+            assert_eq!(ui.get_index(), 1);
+        }
+
+        #[test]
+        fn push_button_clicks_keys_and_disabled() {
+            let d = Driver::new();
+            let ui = &d.ui;
+
+            // A click fires once and does not take the focus (as in Fluent).
+            d.click(BUTTON);
+            assert_eq!(ui.get_clicks(), 1);
+            assert!(!ui.get_button_focused());
+
+            // Reached with Tab (after the drop-down), Space and Return press it.
+            d.key(Key::Tab);
+            d.key(Key::Tab);
+            assert!(ui.get_button_focused());
+            d.key(Key::Space);
+            d.key(Key::Return);
+            assert_eq!(ui.get_clicks(), 3);
+
+            // Disabled: nothing.
+            ui.set_button_enabled(false);
+            d.click(BUTTON);
+            d.key(Key::Return);
+            assert_eq!(ui.get_clicks(), 3);
         }
     }
 }

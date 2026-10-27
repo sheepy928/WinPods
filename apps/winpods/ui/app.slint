@@ -1,10 +1,11 @@
 // WinPods main window (Fluent style, follows the system light/dark theme).
 // State and callbacks live in the `App` global (state.slint); src/ui.rs drives it.
 
-import { Button, Palette } from "std-widgets.slint";
+import { Palette } from "std-widgets.slint";
 import { App, ScanRow, StatusKind } from "state.slint";
 import { Theme } from "theme.slint";
 import { SoftShadow } from "controls.slint";
+import { PushButton } from "widgets.slint";
 import { MainPage } from "main-page.slint";
 import { SettingsPage } from "settings-page.slint";
 
@@ -61,14 +62,14 @@ component CloseHint inherits Rectangle {
                     padding-top: 20px;
                     padding-bottom: 20px;
                     spacing: 8px;
-                    Button {
+                    PushButton {
                         text: "Quit WinPods";
                         horizontal-stretch: 1;
                         clicked => {
                             App.close-hint-closed(true);
                         }
                     }
-                    Button {
+                    PushButton {
                         text: "Got it";
                         primary: true;
                         horizontal-stretch: 1;

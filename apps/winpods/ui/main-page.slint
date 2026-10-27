@@ -1,11 +1,11 @@
 // Main page: speaker card with the Connect switch and level meter, audio source,
 // latency, volume and a compact stats line.
 
-import { Button, ScrollView, Slider, Switch } from "std-widgets.slint";
+import { ScrollView, Slider, Switch } from "std-widgets.slint";
 import { App, StatusKind } from "state.slint";
 import { Theme, Icons } from "theme.slint";
 import { Card, Caption, IconButton, InfoBar, LevelMeter, Segmented, SpeakerTile, StatusPill } from "controls.slint";
-import { OpenAwareComboBox } from "open-aware-combo-box.slint";
+import { DropDown, PushButton } from "widgets.slint";
 import { WheelSafeSpinBox } from "wheel-safe-spinbox.slint";
 
 export component MainPage inherits Rectangle {
@@ -80,7 +80,7 @@ export component MainPage inherits Rectangle {
             if App.update-available || App.update-error != "": InfoBar {
                 title: App.update-available ? "WinPods " + App.update-version + " is available" : "WinPods update";
                 message: App.update-busy ? App.update-status : App.update-error != "" ? (App.update-available ? App.update-error + (App.update-can-install ? " Try again." : " Download it from the release page.") : App.update-error) : App.update-can-install ? (App.connect-on ? "Installs in a few seconds; streaming resumes on its own." : "Installs in a few seconds and restarts WinPods.") : "Download it from the release page.";
-                if App.update-available: Button {
+                if App.update-available: PushButton {
                     text: App.update-can-install ? "Install & restart" : "Open release page";
                     primary: true;
                     enabled: !App.update-busy;
@@ -88,7 +88,7 @@ export component MainPage inherits Rectangle {
                         App.install-update();
                     }
                 }
-                if !App.update-available: Button {
+                if !App.update-available: PushButton {
                     text: "Dismiss";
                     clicked => {
                         App.dismiss-update-error();
@@ -186,7 +186,7 @@ export component MainPage inherits Rectangle {
                     color: Theme.text;
                     font-weight: 600;
                 }
-                OpenAwareComboBox {
+                DropDown {
                     model: App.sources;
                     current-index <=> App.source-index;
                     accessible-label: "Audio source";
