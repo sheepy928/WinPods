@@ -13,6 +13,10 @@
 //! [`MERGE_WINDOW`] later; callbacks arriving meanwhile merge into that one check.
 //! The check asks for the Multimedia default itself, so the event always carries the
 //! endpoint capture would open for [`crate::CaptureSource::DefaultRender`].
+//!
+//! Endpoints being added, removed, enabled or disabled (a headset plugged in) are
+//! merged the same way into one [`DeviceEvent::DevicesChanged`], so the source list
+//! can be refreshed.
 
 use std::io;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
@@ -36,6 +40,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub enum DeviceEvent {
     /// The default render device (Multimedia role) changed to the endpoint `id`.
     DefaultRenderChanged { id: String },
+    /// An endpoint was added, removed, enabled or disabled: list the devices again.
+    DevicesChanged,
 }
 
 /// Messages to the watch thread.
@@ -44,6 +50,8 @@ enum Request {
     Default(SyncSender<io::Result<Option<DeviceInfo>>>),
     /// A relevant default-device callback fired.
     Notify,
+    /// An endpoint added/removed/state-changed callback fired.
+    DevicesNotify,
     Stop,
 }
 
@@ -54,8 +62,9 @@ pub struct DeviceWatch {
 }
 
 impl DeviceWatch {
-    /// Start the watch thread. Default render changes are sent to `events`; the
-    /// current default at start-up is not reported (ask [`Self::default_render`]).
+    /// Start the watch thread. Default render changes and endpoint changes are sent
+    /// to `events`; the current default at start-up is not reported (ask
+    /// [`Self::default_render`]).
     /// Fails if COM or the device enumerator cannot be set up. A failed notification
     /// registration is logged and leaves the 5 s poll in charge.
     pub fn start(events: UnboundedSender<DeviceEvent>) -> std::io::Result<DeviceWatch> {
@@ -167,6 +176,8 @@ struct Schedule {
     next_poll: Instant,
     /// Deadline of a merged notification check, if one is pending.
     pending: Option<Instant>,
+    /// Deadline of a merged "devices changed" report, if one is pending.
+    devices: Option<Instant>,
 }
 
 impl Schedule {
@@ -174,6 +185,7 @@ impl Schedule {
         Self {
             next_poll: now + POLL_INTERVAL,
             pending: None,
+            devices: None,
         }
     }
 
@@ -182,6 +194,22 @@ impl Schedule {
         if self.pending.is_none() {
             self.pending = Some(now + MERGE_WINDOW);
         }
+    }
+
+    /// An endpoint changed: report after the merge window (unless one is pending).
+    fn notify_devices(&mut self, now: Instant) {
+        if self.devices.is_none() {
+            self.devices = Some(now + MERGE_WINDOW);
+        }
+    }
+
+    /// True when a merged "devices changed" report is due; consumes it.
+    fn take_devices_due(&mut self, now: Instant) -> bool {
+        let due = self.devices.is_some_and(|at| now >= at);
+        if due {
+            self.devices = None;
+        }
+        due
     }
 
     /// True when a check is due; consumes the pending check and restarts the poll.
@@ -196,9 +224,10 @@ impl Schedule {
 
     /// How long to sleep until the next check.
     fn wait_time(&self, now: Instant) -> Duration {
-        let next = self
-            .pending
-            .map_or(self.next_poll, |at| at.min(self.next_poll));
+        let next = [self.pending, self.devices]
+            .into_iter()
+            .flatten()
+            .fold(self.next_poll, Instant::min);
         next.saturating_duration_since(now)
     }
 }
@@ -251,8 +280,13 @@ fn watch_thread(
                 let _ = reply.send(result);
             }
             Ok(Request::Notify) => schedule.notify(Instant::now()),
+            Ok(Request::DevicesNotify) => schedule.notify_devices(Instant::now()),
             Ok(Request::Stop) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
+        }
+        if schedule.take_devices_due(Instant::now()) {
+            tracing::debug!("audio endpoints changed");
+            let _ = events.send(DeviceEvent::DevicesChanged);
         }
         if schedule.take_due(Instant::now()) {
             match devices::default_render_id(&enumerator) {
@@ -271,17 +305,30 @@ fn watch_thread(
     drop(enumerator);
 }
 
-/// Register the default-device callback; `None` (logged) when Windows refuses.
+/// Register the default-device and endpoint callbacks; `None` (logged) when Windows
+/// refuses.
 fn register(
     enumerator: &DeviceEnumerator,
     notify: Sender<Request>,
 ) -> Option<DeviceEventRegistration> {
     let mut callbacks = DeviceEventCallbacks::new();
+    let added = notify.clone();
+    let removed = notify.clone();
+    let state = notify.clone();
     callbacks.set_default_device_callback(move |direction, role, _id| {
         if is_relevant(direction, role) {
             // Unbounded channel: never blocks the Windows notification thread.
             let _ = notify.send(Request::Notify);
         }
+    });
+    callbacks.set_device_added_callback(move |_id| {
+        let _ = added.send(Request::DevicesNotify);
+    });
+    callbacks.set_device_removed_callback(move |_id| {
+        let _ = removed.send(Request::DevicesNotify);
+    });
+    callbacks.set_device_state_callback(move |_id, _state| {
+        let _ = state.send(Request::DevicesNotify);
     });
     match enumerator.register_notification_callback(callbacks) {
         Ok(registration) => Some(registration),
@@ -351,6 +398,34 @@ mod tests {
         let t1 = t0 + Duration::from_secs(1);
         s.notify(t1);
         assert!(s.take_due(t1 + MERGE_WINDOW));
+    }
+
+    #[test]
+    fn device_changes_merge_into_one_report() {
+        let t0 = Instant::now();
+        let mut s = Schedule::new(t0);
+        assert!(!s.take_devices_due(t0));
+
+        // A headset arriving fires added + state changed for each endpoint.
+        s.notify_devices(t0);
+        s.notify_devices(t0 + Duration::from_millis(50));
+        s.notify_devices(t0 + Duration::from_millis(120));
+        assert_eq!(
+            s.wait_time(t0 + Duration::from_millis(120)),
+            Duration::from_millis(130),
+            "the report is due one window after the first callback"
+        );
+        assert!(!s.take_devices_due(t0 + Duration::from_millis(249)));
+        assert!(s.take_devices_due(t0 + MERGE_WINDOW));
+        assert!(!s.take_devices_due(t0 + Duration::from_millis(300)), "once");
+        assert_eq!(s.wait_time(t0 + MERGE_WINDOW), POLL_INTERVAL - MERGE_WINDOW);
+
+        // Independent of the default-device check.
+        assert!(!s.take_due(t0 + MERGE_WINDOW));
+        let t1 = t0 + Duration::from_secs(1);
+        s.notify_devices(t1);
+        assert!(!s.take_due(t1 + MERGE_WINDOW));
+        assert!(s.take_devices_due(t1 + MERGE_WINDOW));
     }
 
     #[test]

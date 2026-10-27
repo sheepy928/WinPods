@@ -119,7 +119,10 @@ pub enum ScanState {
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     pub state: State,
-    /// Last error (connect failure, stream end reason), empty when none.
+    /// Last error (connect failure, stream end reason), empty when none. Without
+    /// one it carries `capture_error`, which can be set while `state` is
+    /// `Streaming`: a UI that shows `error` only in `Error`/`Reconnecting` hides
+    /// capture failures (see `capture_error`).
     pub error: String,
     /// Seconds until the next reconnect attempt (Reconnecting only).
     pub retry_in_s: f32,
@@ -144,10 +147,19 @@ pub struct Snapshot {
     pub capture_name: String,
     pub capture_rate: u32,
     pub capture_format: String,
+    /// Why capture is not running while a connection is wanted (device lost, not
+    /// found, not responding); empty while capturing or disconnected.
+    ///
+    /// `state` stays `Streaming` while this is set: the stream keeps running (the
+    /// receiver plays silence) and capture is retried every 2 s, so it recovers on
+    /// its own once the device is back. UIs must therefore show it in the
+    /// `Streaming` state too (status/error text, capture line, tray tooltip);
+    /// `capture_name`/`capture_rate`/`capture_format` are empty meanwhile.
+    pub capture_error: String,
     pub devices: Arc<Vec<DeviceInfo>>,
 
     // clock
-    /// PTP locked, or NTP timing requests arriving.
+    /// PTP locked, or (NTP) the receiver's timing requests answered this stream.
     pub clock_ok: bool,
     pub ptp_offset_ms: f64,
     pub ptp_spread_ms: f64,

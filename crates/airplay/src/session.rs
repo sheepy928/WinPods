@@ -20,8 +20,9 @@
 //!    (TEARDOWN `Session: 0`; the whole call finishes within 3 s).
 //!
 //! Internally one task owns the RTSP connection; volume, feedback and teardown go
-//! through it. Read EOF or 3 consecutive feedback failures set
-//! [`Session::end_reason`].
+//! through it. Read EOF (or another connection failure) or 3 consecutive POST
+//! /feedback requests without a response set [`Session::end_reason`]; a feedback
+//! answered with an error status is only logged, as pyatv does.
 //!
 //! Implementation notes:
 //!
@@ -40,9 +41,12 @@
 //!   waiting for the feedback's reply, which yields the same CSeq sequence (metadata,
 //!   RECORD, feedback, FLUSH, volume — `rtsp_requests.json`).
 //! * Like pyatv's loop, the next feedback is due 2 s after the previous one was
-//!   answered or failed, so at most one is outstanding. Failures are counted per run
-//!   of consecutive failures; the third one sets the end reason (pyatv only logged
-//!   them).
+//!   answered or failed, so at most one is outstanding. pyatv only logs failures.
+//!   Here a run of consecutive *unanswered* feedbacks (timeout, connection error)
+//!   is counted and the third one sets the end reason, which catches a receiver
+//!   that went silent without closing the connection. Any response, an error
+//!   status included, proves the receiver is there: it is logged and resets the
+//!   run.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
@@ -72,7 +76,8 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_PAIRING_RETRIES: u32 = 3;
 /// Interval between POST /feedback requests.
 pub const FEEDBACK_INTERVAL: Duration = Duration::from_secs(2);
-/// Consecutive feedback failures that end the session.
+/// Consecutive POST /feedback requests without a response that end the session
+/// (error statuses do not count).
 pub const FEEDBACK_FAILURE_LIMIT: u32 = 3;
 /// How long `setup` waits for the PTP follower to lock.
 pub const PTP_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -599,8 +604,18 @@ struct Feedback {
     /// When the next POST /feedback is due (`None` = none scheduled: the loop is
     /// not running, or one is waiting for its response).
     next: Option<Instant>,
-    /// Consecutive failures so far.
+    /// Consecutive unanswered feedbacks so far.
     failures: u32,
+}
+
+/// Whether a failed POST /feedback counts toward [`FEEDBACK_FAILURE_LIMIT`]: only
+/// a missing response or a broken connection does. An error status means the
+/// receiver answered, which the normative Python (pyatv) just logs.
+fn feedback_failure_counts(err: &RtspError) -> bool {
+    !matches!(
+        err,
+        RtspError::Status { .. } | RtspError::NotAuthenticated { .. }
+    )
 }
 
 /// Who is waiting for the response to a request on the wire.
@@ -849,6 +864,11 @@ impl Actor {
                     }
                 }
             }
+            Err(err) if !feedback_failure_counts(&err) => {
+                // Answered, just not with 2xx: the receiver is alive.
+                self.feedback.failures = 0;
+                debug!("feedback answered with an error: {err}");
+            }
             Err(err) => {
                 self.feedback.failures += 1;
                 debug!(failures = self.feedback.failures, "feedback failed: {err}");
@@ -971,6 +991,26 @@ mod tests {
     fn session_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Session>();
+    }
+
+    #[test]
+    fn only_unanswered_feedback_counts_as_a_failure() {
+        assert!(!feedback_failure_counts(&RtspError::Status {
+            method: "POST".into(),
+            code: 500,
+            reason: "Internal Server Error".into(),
+        }));
+        assert!(!feedback_failure_counts(&RtspError::NotAuthenticated {
+            method: "POST".into(),
+            code: 403,
+        }));
+        assert!(feedback_failure_counts(&RtspError::Timeout(
+            "POST /feedback (CSeq 9)".into()
+        )));
+        assert!(feedback_failure_counts(&RtspError::Closed));
+        assert!(feedback_failure_counts(&RtspError::Io(
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset",)
+        )));
     }
 
     #[test]
