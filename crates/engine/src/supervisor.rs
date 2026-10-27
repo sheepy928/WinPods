@@ -1325,6 +1325,7 @@ mod tests {
 
     #[test]
     fn busy_ptp_ports_fail_before_the_receiver_is_contacted() {
+        let _lock = crate::connect::ptp_ports_test_lock();
         // Hold 319/320 on loopback (when someone else already has them, the
         // follower cannot get them either).
         let _event = UdpSocket::bind((Ipv4Addr::LOCALHOST, 319));
