@@ -1,10 +1,11 @@
 // Main page: speaker card with the Connect switch and level meter, audio source,
 // latency, volume and a compact stats line.
 
-import { Button, ComboBox, ScrollView, Slider, Switch } from "std-widgets.slint";
+import { Button, ScrollView, Slider, Switch } from "std-widgets.slint";
 import { App, StatusKind } from "state.slint";
 import { Theme, Icons } from "theme.slint";
 import { Card, Caption, IconButton, InfoBar, LevelMeter, Segmented, SpeakerTile, StatusPill } from "controls.slint";
+import { OpenAwareComboBox } from "open-aware-combo-box.slint";
 import { WheelSafeSpinBox } from "wheel-safe-spinbox.slint";
 
 export component MainPage inherits Rectangle {
@@ -185,16 +186,15 @@ export component MainPage inherits Rectangle {
                     color: Theme.text;
                     font-weight: 600;
                 }
-                ComboBox {
+                OpenAwareComboBox {
                     model: App.sources;
                     current-index <=> App.source-index;
                     accessible-label: "Audio source";
-                    // Opening the list (click or keyboard focus) re-enumerates devices,
-                    // so newly plugged-in ones show up.
-                    changed has-focus => {
-                        if self.has-focus {
-                            App.refresh-sources();
-                        }
+                    // Each opening of the list (click, Return, screen reader)
+                    // re-enumerates devices, so newly plugged-in ones show up; the
+                    // list updates in place while it is open.
+                    opened => {
+                        App.refresh-sources();
                     }
                     selected => {
                         App.source-selected(self.current-index);

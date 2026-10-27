@@ -2528,4 +2528,169 @@ mod tests {
             assert_eq!(ui.get_page_scrolled(), 160.0);
         }
     }
+
+    /// The main page's Source list asks for a device refresh each time it opens
+    /// (`opened` -> `App.refresh-sources()`): driven with real pointer and key events
+    /// in a headless window (software renderer, no screen).
+    mod open_aware_combo_box {
+        use std::rc::Rc;
+
+        use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
+        use slint::platform::{Key, Platform, PointerEventButton, WindowAdapter, WindowEvent};
+        use slint::{ComponentHandle, LogicalPosition, PhysicalSize, PlatformError};
+
+        #[allow(clippy::all, clippy::pedantic, missing_docs, unused_qualifications)]
+        mod harness {
+            slint::slint! {
+                #[style = "fluent"]
+                import { OpenAwareComboBox } from "../ui/open-aware-combo-box.slint";
+
+                export component Harness inherits Window {
+                    width: 300px;
+                    height: 400px;
+                    in-out property <[string]> sources: ["Speakers", "Headphones"];
+                    in-out property <int> index;
+                    out property <int> opened;
+                    out property <int> picked: -1;
+                    out property <bool> focused: combo.has-focus;
+                    out property <bool> expanded: combo.accessible-expanded;
+                    combo := OpenAwareComboBox {
+                        x: 10px;
+                        y: 10px;
+                        width: 200px;
+                        model: root.sources;
+                        current-index <=> root.index;
+                        opened => {
+                            root.opened += 1;
+                        }
+                        selected => {
+                            root.picked = self.current-index;
+                        }
+                    }
+                    // Something else that takes focus when clicked.
+                    FocusScope {
+                        x: 10px;
+                        y: 300px;
+                        width: 80px;
+                        height: 40px;
+                    }
+                }
+            }
+        }
+        use harness::Harness;
+
+        struct HeadlessPlatform(Rc<MinimalSoftwareWindow>);
+
+        impl Platform for HeadlessPlatform {
+            fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
+                Ok(self.0.clone())
+            }
+        }
+
+        struct Driver {
+            ui: Harness,
+        }
+
+        impl Driver {
+            fn send(&self, event: WindowEvent) {
+                self.ui.window().dispatch_event(event);
+                // Runs the `changed` handlers, as each event-loop iteration does.
+                slint::platform::update_timers_and_animations();
+            }
+
+            fn click(&self, x: f32, y: f32) {
+                let position = LogicalPosition::new(x, y);
+                self.send(WindowEvent::PointerMoved { position });
+                let button = PointerEventButton::Left;
+                self.send(WindowEvent::PointerPressed { position, button });
+                self.send(WindowEvent::PointerReleased { position, button });
+            }
+
+            fn key(&self, text: slint::SharedString) {
+                self.send(WindowEvent::KeyPressed { text: text.clone() });
+                self.send(WindowEvent::KeyReleased { text });
+            }
+        }
+
+        #[test]
+        fn opened_fires_on_every_opening_whatever_closed_the_list() {
+            let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+            slint::platform::set_platform(Box::new(HeadlessPlatform(window.clone())))
+                .expect("a fresh test thread has no Slint platform yet");
+            let ui = Harness::new().unwrap();
+            ui.show().unwrap();
+            window.set_size(PhysicalSize::new(300, 400));
+            let d = Driver { ui };
+            let ui = &d.ui;
+
+            // The closed box spans x 10..210, y 10..42; the open list covers it, one
+            // 40px row per entry starting at y 10.
+            let combo = (100.0, 26.0);
+            let row = |i: f32| (100.0, 30.0 + 40.0 * i);
+            let outside = (250.0, 380.0);
+            let other_focusable = (50.0, 320.0);
+
+            // Focus alone (Tab) is not an opening.
+            d.key(Key::Tab.into());
+            assert!(ui.get_focused());
+            assert_eq!(ui.get_opened(), 0);
+
+            // First opening, closed with Escape: the box keeps focus.
+            d.click(combo.0, combo.1);
+            assert!(ui.get_expanded());
+            assert_eq!(ui.get_opened(), 1);
+            d.key(Key::Escape.into());
+            assert!(!ui.get_expanded());
+            assert!(ui.get_focused());
+
+            // Reopened (still focused, which a has-focus rule misses), then closed by a
+            // click outside on something that takes no focus.
+            d.click(combo.0, combo.1);
+            assert!(ui.get_expanded());
+            assert_eq!(ui.get_opened(), 2);
+            d.click(outside.0, outside.1);
+            assert!(!ui.get_expanded());
+            assert!(ui.get_focused());
+
+            // Reopened; the refreshed device list arrives while it is open (as the
+            // engine's answer to `refresh-sources` does) and its new row can be picked.
+            d.click(combo.0, combo.1);
+            assert_eq!(ui.get_opened(), 3);
+            ui.set_sources(slint::ModelRc::new(slint::VecModel::from(vec![
+                slint::SharedString::from("Speakers"),
+                slint::SharedString::from("Headphones"),
+                slint::SharedString::from("USB headset"),
+            ])));
+            slint::platform::update_timers_and_animations();
+            assert!(ui.get_expanded(), "a new list does not close the popup");
+            d.click(row(2.0).0, row(2.0).1);
+            assert!(!ui.get_expanded());
+            assert_eq!(ui.get_picked(), 2);
+            assert_eq!(ui.get_index(), 2);
+            assert!(ui.get_focused());
+
+            // Reopened after picking a row.
+            d.click(combo.0, combo.1);
+            assert_eq!(ui.get_opened(), 4);
+            d.key(Key::Return.into());
+            assert!(!ui.get_expanded());
+
+            // Opened from the keyboard.
+            d.key(Key::Return.into());
+            assert!(ui.get_expanded());
+            assert_eq!(ui.get_opened(), 5);
+            d.key(Key::Escape.into());
+
+            // Focus moving away and back (another control, the window losing and
+            // regaining activation) is not an opening either.
+            d.click(other_focusable.0, other_focusable.1);
+            assert!(!ui.get_focused());
+            d.send(WindowEvent::WindowActiveChanged(false));
+            d.send(WindowEvent::WindowActiveChanged(true));
+            d.key(Key::Tab.into());
+            assert_eq!(ui.get_opened(), 5);
+            d.click(combo.0, combo.1);
+            assert_eq!(ui.get_opened(), 6);
+        }
+    }
 }
