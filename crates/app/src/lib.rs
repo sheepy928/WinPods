@@ -9,4 +9,9 @@ pub mod single_instance;
 pub mod update_key;
 pub mod updater;
 
+mod win;
+
+#[cfg(test)]
+mod test_support;
+
 pub use config::Config;
