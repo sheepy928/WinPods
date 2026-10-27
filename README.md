@@ -90,11 +90,12 @@ never changes firewall or other security settings.
 
 * **Start with Windows**: adds WinPods to your sign-in apps (minimized to the tray). If
   you disable it in Task Manager → Startup apps, WinPods shows that instead of fighting it.
-* **Automatic updates**: once a day WinPods checks GitHub for a newer release. Updates
-  are only installed if the release's checksum file carries a valid signature from the
-  WinPods release key built into the app; then the new exe is swapped in and WinPods
-  restarts (streaming resumes by itself). Without a valid signature you only get a link
-  to the release page.
+* **Automatic updates**: once a day WinPods checks GitHub for a newer release. A release
+  is only offered if its checksum file carries a valid signature from the WinPods
+  release key built into the app (unsigned releases are ignored); the new exe is then
+  downloaded, checked against the signed checksums and swapped in, and WinPods
+  restarts (streaming resumes by itself). If WinPods runs from a folder it cannot
+  write to, or from inside the zip, you get a link to the release page instead.
 * **Advanced**: clock protocol (PTP for HomePods; NTP for older AirPlay 2 speakers),
   audio format (ALAC; PCM for speakers that need it), renderer (use *software* if the
   window stays blank, e.g. over Remote Desktop), log level, log folder.

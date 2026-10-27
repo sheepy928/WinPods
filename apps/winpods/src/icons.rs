@@ -7,12 +7,14 @@
 
 use winpods_engine::State;
 
+use crate::view::StatusKind;
+
 /// An sRGB colour without alpha.
 pub type Rgb = [u8; 3];
 
 /// Grey: not connected.
 pub const COLOR_DISCONNECTED: Rgb = [0x8a, 0x8a, 0x8a];
-/// Amber: connecting or waiting to reconnect.
+/// Amber: connecting, waiting to reconnect, or streaming without captured audio.
 pub const COLOR_CONNECTING: Rgb = [0xe0, 0xa0, 0x00];
 /// Green: streaming.
 pub const COLOR_STREAMING: Rgb = [0x2e, 0xaa, 0x4a];
@@ -65,6 +67,17 @@ impl From<State> for TrayIconKind {
             State::Connecting | State::Reconnecting => TrayIconKind::Connecting,
             State::Streaming => TrayIconKind::Streaming,
             State::Error => TrayIconKind::Error,
+        }
+    }
+}
+
+impl From<StatusKind> for TrayIconKind {
+    fn from(kind: StatusKind) -> Self {
+        match kind {
+            StatusKind::Idle => TrayIconKind::Disconnected,
+            StatusKind::Busy => TrayIconKind::Connecting,
+            StatusKind::Ok => TrayIconKind::Streaming,
+            StatusKind::Error => TrayIconKind::Error,
         }
     }
 }

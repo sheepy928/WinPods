@@ -178,7 +178,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force sig | Out-Null
           if (-not $env:MINISIGN_SECRET_KEY) {
-            Write-Output "::warning::MINISIGN_SECRET_KEY is not set; publishing WITHOUT a signature. WinPods only installs signed updates, so this release will not be offered as an automatic update."
+            Write-Output "::warning::MINISIGN_SECRET_KEY is not set; publishing WITHOUT a signature. WinPods ignores unsigned releases, so this one will not be offered as an update."
             exit 0
           }
           $comment = "WinPods $($env:GITHUB_REF_NAME) windows-x64"

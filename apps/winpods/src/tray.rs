@@ -40,6 +40,8 @@ pub enum TrayEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrayModel {
     pub state: State,
+    /// Icon colour; usually follows `state`, but amber while streaming without audio.
+    pub icon: TrayIconKind,
     pub tooltip: String,
     /// The user wants to be connected (menu shows "Disconnect").
     pub connected: bool,
@@ -55,6 +57,7 @@ impl Default for TrayModel {
     fn default() -> Self {
         Self {
             state: State::Disconnected,
+            icon: TrayIconKind::Disconnected,
             tooltip: APP_NAME.to_string(),
             connected: false,
             latency_ms: 100,
@@ -268,7 +271,7 @@ impl SystemTray {
             .with_menu(Box::new(self.menu.clone()))
             .with_menu_on_left_click(false)
             .with_tooltip(&self.model.tooltip);
-        if let Some(icon) = self.icon_for(TrayIconKind::from(self.model.state)) {
+        if let Some(icon) = self.icon_for(self.model.icon) {
             builder = builder.with_icon(icon);
         }
         Ok(builder.build()?)
@@ -337,7 +340,7 @@ impl Tray for SystemTray {
         }
         let state_changed = model.state != self.model.state;
         let tooltip_changed = model.tooltip != self.model.tooltip;
-        let kind_changed = TrayIconKind::from(model.state) != TrayIconKind::from(self.model.state);
+        let kind_changed = model.icon != self.model.icon;
         self.model = model.clone();
 
         if self.icon.is_none() {
@@ -345,7 +348,7 @@ impl Tray for SystemTray {
             return;
         }
         if kind_changed {
-            let icon = self.icon_for(TrayIconKind::from(model.state));
+            let icon = self.icon_for(model.icon);
             if let (Some(tray), Some(icon)) = (&self.icon, icon)
                 && let Err(err) = tray.set_icon(Some(icon))
             {
@@ -439,6 +442,7 @@ mod tests {
     fn default_model_is_disconnected() {
         let model = TrayModel::default();
         assert_eq!(model.state, State::Disconnected);
+        assert_eq!(model.icon, TrayIconKind::Disconnected);
         assert_eq!(model.tooltip, "WinPods");
         assert!(!model.connected);
         assert_eq!(model.update_version, None);

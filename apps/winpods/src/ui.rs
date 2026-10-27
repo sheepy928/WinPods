@@ -41,6 +41,7 @@ use winpods_engine::{
     CaptureSelection, Command, DeviceInfo, EngineApi, ScanResult, ScanState, Snapshot,
 };
 
+use crate::icons::TrayIconKind;
 use crate::tray::{SystemTray, Tray, TrayEvent, TrayModel};
 use crate::view::{self, LATENCY_PRESETS, LOG_LEVELS, RENDERERS, VolumeThrottle};
 
@@ -1129,6 +1130,7 @@ impl Controller {
         let speaker = view::speaker_title(&snapshot, &s.config.device_name, &s.config.device_ip);
         TrayModel {
             state: snapshot.state,
+            icon: TrayIconKind::from(view::status_kind(&snapshot)),
             tooltip: view::tray_tooltip(&snapshot, &speaker),
             connected: s.wants,
             latency_ms: s.config.latency_clamped(),
@@ -1190,7 +1192,7 @@ impl Controller {
             let has_address = !view::effective_address(&snap, &s.config.device_ip).is_empty();
             (
                 view::status_text(&snap, has_address),
-                view::StatusKind::from(snap.state),
+                view::status_kind(&snap),
                 view::error_line(&snap, s.no_address_hint),
             )
         };

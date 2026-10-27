@@ -123,6 +123,24 @@ impl From<State> for StatusKind {
     }
 }
 
+/// Why no audio is being captured while the stream is up or coming up, if so. The
+/// engine stays `Streaming` while capture is retried (the speaker plays silence), so
+/// without this a lost capture device would look like a working stream.
+pub fn capture_problem(snap: &Snapshot) -> Option<&str> {
+    let problem = snap.capture_error.trim();
+    let shown = matches!(snap.state, State::Streaming | State::Connecting);
+    (shown && !problem.is_empty()).then_some(problem)
+}
+
+/// Colour of the status pill: amber instead of green while streaming without audio.
+pub fn status_kind(snap: &Snapshot) -> StatusKind {
+    if capture_problem(snap).is_some() {
+        StatusKind::Busy
+    } else {
+        StatusKind::from(snap.state)
+    }
+}
+
 /// Text of the status pill: "Streaming · 100 ms", "Reconnecting in 3 s", ...
 pub fn status_text(snap: &Snapshot, has_address: bool) -> String {
     match snap.state {
@@ -219,7 +237,7 @@ pub const NO_ADDRESS_HINT: &str =
 pub fn error_line(snap: &Snapshot, no_address_hint: bool) -> String {
     let engine_error = match snap.state {
         State::Error | State::Reconnecting => snap.error.trim(),
-        _ => "",
+        _ => capture_problem(snap).unwrap_or(""),
     };
     if !engine_error.is_empty() {
         engine_error.to_string()
@@ -315,7 +333,10 @@ pub fn speaker_detail(snap: &Snapshot, saved_ip: &str) -> String {
 /// What is being captured: "Capturing Speakers (Realtek(R) Audio) · 48 kHz".
 pub fn capture_detail(snap: &Snapshot) -> String {
     if snap.capture_name.trim().is_empty() {
-        return "Not capturing".to_string();
+        return match capture_problem(snap) {
+            Some(problem) => truncate_chars(&format!("Not capturing: {problem}"), 90),
+            None => "Not capturing".to_string(),
+        };
     }
     if snap.capture_rate == 0 {
         return format!("Capturing {}", snap.capture_name.trim());
@@ -342,7 +363,11 @@ pub fn truncate_chars(text: &str, max: usize) -> String {
 
 /// Tray tooltip (always below [`TOOLTIP_MAX_CHARS`] characters).
 pub fn tray_tooltip(snap: &Snapshot, speaker: &str) -> String {
+    let problem = capture_problem(snap);
     let detail = match snap.state {
+        State::Streaming if problem.is_some() => {
+            format!("No audio: {}", problem.unwrap_or_default())
+        }
         State::Streaming => format!(
             "Streaming to {speaker} ({})",
             latency_label(snap.latency_ms)
@@ -839,6 +864,50 @@ mod tests {
         assert_eq!(capture_detail(&snap), "Capturing Speakers · 48 kHz");
         snap.capture_rate = 44_100;
         assert_eq!(capture_detail(&snap), "Capturing Speakers · 44.1 kHz");
+    }
+
+    #[test]
+    fn capture_failure_while_streaming_is_shown() {
+        let mut snap = streaming();
+        snap.capture_name.clear();
+        snap.capture_rate = 0;
+        snap.capture_error = "capture device lost: Speakers".into();
+        // The engine also mirrors it into `error`; Streaming must still show it.
+        snap.error = snap.capture_error.clone();
+
+        assert_eq!(
+            capture_problem(&snap),
+            Some("capture device lost: Speakers")
+        );
+        assert_eq!(status_kind(&snap), StatusKind::Busy);
+        assert_eq!(status_text(&snap, true), "Streaming · 100 ms");
+        assert_eq!(error_line(&snap, false), "capture device lost: Speakers");
+        assert_eq!(
+            capture_detail(&snap),
+            "Not capturing: capture device lost: Speakers"
+        );
+        assert_eq!(
+            tray_tooltip(&snap, "Living Room"),
+            "WinPods - No audio: capture device lost: Speakers"
+        );
+
+        snap.capture_error = format!("device lost: {}", "x".repeat(300));
+        assert!(capture_detail(&snap).chars().count() <= 90);
+        assert!(tray_tooltip(&snap, "x").chars().count() <= TOOLTIP_MAX_CHARS);
+
+        // Disconnected: a leftover capture error is not shown.
+        snap.state = State::Disconnected;
+        assert_eq!(capture_problem(&snap), None);
+        assert_eq!(status_kind(&snap), StatusKind::Idle);
+        assert_eq!(error_line(&snap, false), "");
+        assert_eq!(capture_detail(&snap), "Not capturing");
+
+        // Capturing again: back to green.
+        snap.state = State::Streaming;
+        snap.capture_error.clear();
+        snap.capture_name = "Speakers".into();
+        assert_eq!(status_kind(&snap), StatusKind::Ok);
+        assert_eq!(error_line(&snap, false), "");
     }
 
     #[test]
