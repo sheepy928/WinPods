@@ -1,0 +1,10 @@
+pyatv==0.18.0
+# pyatv 0.18 calls SRPClientSession(context, private); srptools 2.x made that keyword-only
+srptools>=1.0,<2
+pyaudiowpatch>=0.2.12
+numpy>=2.0
+soxr>=0.5
+pystray>=0.19
+pillow>=10.0
+# optional: lets WinPods follow the real Windows default playback device
+pycaw>=20240316
