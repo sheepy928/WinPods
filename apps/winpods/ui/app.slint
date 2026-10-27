@@ -1,12 +1,105 @@
-// Placeholder window (the UI workstream replaces this file and adds the rest).
-import { Button, VerticalBox } from "std-widgets.slint";
+// WinPods main window (Fluent style, follows the system light/dark theme).
+// State and callbacks live in the `App` global (state.slint); src/ui.rs drives it.
+
+import { Button, Palette } from "std-widgets.slint";
+import { App, ScanRow, StatusKind } from "state.slint";
+import { Theme } from "theme.slint";
+import { MainPage } from "main-page.slint";
+import { SettingsPage } from "settings-page.slint";
+
+export { App, ScanRow, StatusKind }
+
+// One-time hint shown the first time the window is closed.
+component CloseHint inherits Rectangle {
+    background: Theme.scrim;
+    // Swallow clicks on the scrim.
+    TouchArea { }
+    dialog := Rectangle {
+        width: min(380px, root.width - 32px);
+        height: content.preferred-height;
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        background: Theme.dark ? #2b2b2b : #ffffff;
+        border-radius: Theme.radius;
+        border-width: 1px;
+        border-color: Theme.dark ? #3d3d3d : #d9d9d9;
+        drop-shadow-blur: 32px;
+        drop-shadow-offset-y: 8px;
+        drop-shadow-color: #00000059;
+        clip: true;
+        content := VerticalLayout {
+            VerticalLayout {
+                padding: 24px;
+                spacing: 12px;
+                Text {
+                    text: "WinPods keeps running";
+                    color: Theme.text;
+                    font-size: Theme.subtitle;
+                    font-weight: 600;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Audio keeps streaming while the window is closed. Click the WinPods icon in the notification area to open it again, or right-click it to quit.";
+                    color: Theme.text;
+                    wrap: word-wrap;
+                }
+            }
+            Rectangle {
+                background: Theme.dark ? #202020 : #f3f3f3;
+                border-width: 0;
+                HorizontalLayout {
+                    padding: 24px;
+                    padding-top: 20px;
+                    padding-bottom: 20px;
+                    spacing: 8px;
+                    Button {
+                        text: "Quit WinPods";
+                        horizontal-stretch: 1;
+                        clicked => {
+                            App.close-hint-closed(true);
+                        }
+                    }
+                    Button {
+                        text: "Got it";
+                        primary: true;
+                        horizontal-stretch: 1;
+                        clicked => {
+                            App.close-hint-closed(false);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 export component MainWindow inherits Window {
     title: "WinPods";
-    preferred-width: 420px;
-    preferred-height: 560px;
-    VerticalBox {
-        Text { text: "WinPods"; font-size: 20px; }
-        Button { text: "Connect"; }
+    icon: @image-url("../assets/winpods.png");
+    preferred-width: 460px;
+    preferred-height: 660px;
+    min-width: 380px;
+    min-height: 480px;
+    background: Theme.window-bg;
+    default-font-family: "Segoe UI Variable Text";
+    default-font-size: 14px;
+
+    // 0 = follow the system, 1 = light, 2 = dark (used by --demo --theme).
+    public function force-color-scheme(scheme: int) {
+        if scheme == 1 {
+            Palette.color-scheme = ColorScheme.light;
+        } else if scheme == 2 {
+            Palette.color-scheme = ColorScheme.dark;
+        } else {
+            Palette.color-scheme = ColorScheme.unknown;
+        }
     }
+
+    MainPage {
+        visible: App.page == 0;
+    }
+    SettingsPage {
+        visible: App.page == 1;
+    }
+    if App.close-hint-visible: CloseHint { }
 }

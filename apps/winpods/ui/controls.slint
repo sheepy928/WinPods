@@ -1,0 +1,378 @@
+// Small building blocks in the Windows 11 style: settings cards, status pill, level
+// meter, segmented selector, icon button, info bar.
+
+import { Switch } from "std-widgets.slint";
+import { Theme, Icons } from "theme.slint";
+import { StatusKind } from "state.slint";
+
+// Background and outline shared by every card.
+export component CardFrame inherits Rectangle {
+    background: Theme.card-bg;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.card-border;
+}
+
+// A card that stacks its children vertically.
+export component Card inherits CardFrame {
+    in property <length> pad: Theme.card-padding;
+    in property <length> gap: 12px;
+    VerticalLayout {
+        padding: root.pad;
+        spacing: root.gap;
+        @children
+    }
+}
+
+// Section heading above a group of cards.
+export component SectionTitle inherits VerticalLayout {
+    in property <string> text;
+    padding-top: 20px;
+    padding-bottom: 4px;
+    Text {
+        text: root.text;
+        color: Theme.text;
+        font-size: Theme.body;
+        font-weight: 600;
+        accessible-role: AccessibleRole.text;
+    }
+}
+
+// Caption (12 px) in the secondary text colour.
+export component Caption inherits Text {
+    color: Theme.text-secondary;
+    font-size: Theme.caption;
+    wrap: word-wrap;
+}
+
+// Windows 11 settings card: title and description on the left, controls on the right.
+export component SettingRow inherits CardFrame {
+    in property <string> title;
+    in property <string> description;
+    in property <bool> enabled: true;
+    min-height: 64px;
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        padding-top: 11px;
+        padding-bottom: 11px;
+        spacing: 16px;
+        VerticalLayout {
+            alignment: center;
+            spacing: 1px;
+            horizontal-stretch: 1;
+            // Single lines: layouts here do not grow for wrapped text, so elide instead.
+            Text {
+                text: root.title;
+                color: root.enabled ? Theme.text : Theme.text-tertiary;
+                font-size: Theme.body;
+                overflow: elide;
+            }
+            if root.description != "": Caption {
+                text: root.description;
+                color: root.enabled ? Theme.text-secondary : Theme.text-tertiary;
+                wrap: no-wrap;
+                overflow: elide;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            HorizontalLayout {
+                spacing: 8px;
+                @children
+            }
+        }
+    }
+}
+
+// A setting with an On/Off toggle.
+export component SwitchRow inherits SettingRow {
+    in-out property <bool> checked;
+    callback toggled(bool);
+    Text {
+        text: toggle.checked ? "On" : "Off";
+        color: root.enabled ? Theme.text : Theme.text-tertiary;
+        vertical-alignment: center;
+        horizontal-alignment: right;
+        min-width: 24px;
+    }
+    toggle := Switch {
+        enabled: root.enabled;
+        checked <=> root.checked;
+        accessible-label: root.title;
+        toggled => {
+            root.toggled(self.checked);
+        }
+    }
+}
+
+// State colours for a StatusKind.
+global Tones {
+    public pure function fill(kind: StatusKind) -> color {
+        if kind == StatusKind.ok {
+            return Theme.ok;
+        }
+        if kind == StatusKind.busy {
+            return Theme.busy;
+        }
+        if kind == StatusKind.error {
+            return Theme.error;
+        }
+        return Theme.idle;
+    }
+
+    public pure function text(kind: StatusKind) -> color {
+        if kind == StatusKind.ok {
+            return Theme.ok-text;
+        }
+        if kind == StatusKind.busy {
+            return Theme.busy-text;
+        }
+        if kind == StatusKind.error {
+            return Theme.error-text;
+        }
+        return Theme.idle-text;
+    }
+}
+
+// Rounded status chip with a coloured dot (pulses while connecting).
+export component StatusPill inherits Rectangle {
+    in property <string> text;
+    in property <StatusKind> kind;
+    height: 24px;
+    border-radius: self.height / 2;
+    background: Tones.fill(root.kind).with-alpha(Theme.dark ? 0.20 : 0.13);
+    accessible-role: AccessibleRole.text;
+    accessible-label: root.text;
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 11px;
+        spacing: 7px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 8px;
+                height: 8px;
+                border-radius: 4px;
+                background: Tones.fill(root.kind);
+                opacity: root.kind == StatusKind.busy ? 0.55 + 0.45 * sin(animation-tick() / 2.5ms * 1deg) : 1.0;
+            }
+        }
+        Text {
+            text: root.text;
+            color: Tones.text(root.kind);
+            font-size: Theme.caption;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// Square tile with the speaker glyph, tinted with the connection state.
+export component SpeakerTile inherits Rectangle {
+    in property <StatusKind> kind;
+    width: 52px;
+    height: 52px;
+    border-radius: 12px;
+    background: @linear-gradient(160deg, Tones.fill(root.kind).brighter(0.18) 0%, Tones.fill(root.kind) 100%);
+    animate background { duration: 250ms; }
+    Path {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 30px;
+        height: 30px;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: Icons.speaker-body;
+        fill: white;
+        stroke: transparent;
+    }
+    Path {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 30px;
+        height: 30px;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: Icons.speaker-waves;
+        fill: transparent;
+        stroke: white;
+        stroke-width: 2px;
+        stroke-line-cap: round;
+    }
+}
+
+// Horizontal level meter; the gradient is fixed to the track so colours mark levels.
+export component LevelMeter inherits Rectangle {
+    in property <float> level;
+    height: 6px;
+    border-radius: 3px;
+    background: Theme.meter-track;
+    accessible-role: progress-indicator;
+    accessible-value: round(clamp(root.level, 0, 1) * 100) + "%";
+    Rectangle {
+        x: 0;
+        width: clamp(root.level, 0, 1) * root.width;
+        height: root.height;
+        border-radius: 3px;
+        clip: true;
+        Rectangle {
+            x: 0;
+            width: root.width;
+            height: root.height;
+            background: @linear-gradient(90deg, #2eaa4a 0%, #49b85a 60%, #e0a000 88%, #d04040 100%);
+        }
+    }
+}
+
+// Segmented selector (like a row of radio buttons).
+export component Segmented inherits Rectangle {
+    in property <[string]> items;
+    in property <int> selected;
+    callback activated(int);
+    height: 32px;
+    border-radius: Theme.control-radius + 2px;
+    background: Theme.subtle-fill;
+    border-width: 1px;
+    border-color: Theme.dark ? #ffffff0d : #0000000f;
+    accessible-role: tab-list;
+    HorizontalLayout {
+        padding: 3px;
+        spacing: 2px;
+        for item[index] in root.items: Rectangle {
+            horizontal-stretch: 1;
+            border-radius: Theme.control-radius;
+            background: index == root.selected ? Theme.accent : touch.pressed ? Theme.subtle-fill : touch.has-hover ? Theme.subtle-fill-hover : transparent;
+            accessible-role: tab;
+            accessible-label: item;
+            accessible-checked: index == root.selected;
+            accessible-action-default => {
+                root.activated(index);
+            }
+            Text {
+                text: item;
+                color: index == root.selected ? Theme.accent-foreground : Theme.text;
+                font-size: 13px;
+                font-weight: index == root.selected ? 600 : 400;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            touch := TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.activated(index);
+                }
+            }
+        }
+    }
+}
+
+// Borderless square button with a stroked path icon.
+export component IconButton inherits Rectangle {
+    in property <string> icon;
+    in property <string> label;
+    callback clicked;
+    width: 36px;
+    height: 36px;
+    border-radius: Theme.control-radius;
+    background: touch.pressed ? Theme.subtle-fill : touch.has-hover ? Theme.subtle-fill-hover : transparent;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => {
+        root.clicked();
+    }
+    Path {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 18px;
+        height: 18px;
+        viewbox-width: 20;
+        viewbox-height: 20;
+        commands: root.icon;
+        fill: transparent;
+        stroke: Theme.text;
+        stroke-width: 1.3px;
+        stroke-line-cap: round;
+    }
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// Accent-coloured clickable text.
+export component Link inherits Text {
+    callback clicked;
+    color: touch.has-hover ? Theme.accent : Theme.accent;
+    font-size: Theme.body;
+    accessible-role: button;
+    accessible-action-default => {
+        root.clicked();
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// Informational banner (Windows 11 InfoBar) with action buttons as children.
+export component InfoBar inherits Rectangle {
+    in property <string> title;
+    in property <string> message;
+    background: Theme.dark ? #1f2c3a : #e8f1fb;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.dark ? #2b3d50 : #cde0f4;
+    accessible-role: groupbox;
+    accessible-label: root.title;
+    VerticalLayout {
+        padding: 14px;
+        spacing: 10px;
+        HorizontalLayout {
+            spacing: 12px;
+            VerticalLayout {
+                alignment: start;
+                Rectangle {
+                    width: 20px;
+                    height: 20px;
+                    border-radius: 10px;
+                    background: Theme.accent;
+                    Path {
+                        width: 14px;
+                        height: 14px;
+                        viewbox-width: 20;
+                        viewbox-height: 20;
+                        commands: Icons.download;
+                        fill: transparent;
+                        stroke: Theme.accent-foreground;
+                        stroke-width: 1.6px;
+                        stroke-line-cap: round;
+                    }
+                }
+            }
+            VerticalLayout {
+                spacing: 2px;
+                horizontal-stretch: 1;
+                Text {
+                    text: root.title;
+                    color: Theme.text;
+                    font-weight: 600;
+                    wrap: word-wrap;
+                }
+                if root.message != "": Caption {
+                    text: root.message;
+                }
+            }
+        }
+        HorizontalLayout {
+            alignment: end;
+            spacing: 8px;
+            @children
+        }
+    }
+}

@@ -1,0 +1,114 @@
+// UI state shared between the Rust controller (src/ui.rs) and the pages. Rust writes
+// the `in` properties from engine snapshots and config; the pages call the callbacks.
+
+// Colour family of the status pill (mirrors view::StatusKind).
+export enum StatusKind { idle, busy, ok, error }
+
+// One row of the Find popup.
+export struct ScanRow {
+    name: string,
+    detail: string,
+}
+
+export global App {
+    // ---- static
+    in property <string> version: "0.2.0";
+    in property <bool> demo;
+    // 0 = main page, 1 = settings.
+    in-out property <int> page: 0;
+    // Bumped by Rust to scroll the settings page to "About".
+    in property <int> about-request: 0;
+
+    // ---- speaker card
+    in property <string> speaker-name: "No speaker selected";
+    in property <string> speaker-detail;
+    in property <string> status-text: "Disconnected";
+    in property <StatusKind> status-kind: StatusKind.idle;
+    in property <string> error-text;
+    in-out property <bool> connect-on;
+    // Level meter, 0..1 (already on a perceptual scale).
+    in property <float> level: 0;
+
+    // ---- source
+    in property <[string]> sources: ["Windows default output"];
+    in-out property <int> source-index: 0;
+    in property <string> capture-detail;
+
+    // ---- latency
+    in-out property <int> latency-ms: 100;
+    in-out property <bool> latency-custom;
+    in property <string> latency-hint;
+    in property <bool> latency-warning;
+
+    // ---- volume
+    in-out property <bool> volume-enabled;
+    in-out property <float> volume: 40;
+
+    // ---- stats line
+    in property <string> stats-text;
+
+    // ---- updates
+    in property <bool> update-available;
+    in property <string> update-version;
+    in property <string> update-status;
+    in property <bool> update-busy;
+    // false: only "Open release page" is offered (temp copy, read-only folder, unsigned).
+    in property <bool> update-can-install: true;
+    in property <bool> updates-supported: true;
+
+    // ---- settings: speaker
+    in-out property <string> speaker-ip;
+    in property <string> speaker-ip-error;
+    in property <bool> scan-running;
+    in property <string> scan-message;
+    in property <[ScanRow]> scan-results;
+
+    // ---- settings: startup
+    in-out property <bool> start-with-windows;
+    in property <bool> autostart-available: true;
+    in property <string> autostart-note;
+    in property <bool> autostart-other-copy;
+    in-out property <bool> start-minimized;
+    in-out property <bool> auto-connect: true;
+
+    // ---- settings: updates
+    in-out property <bool> auto-update: true;
+
+    // ---- settings: advanced
+    in-out property <int> clock-index;
+    in-out property <int> codec-index;
+    in-out property <int> renderer-index;
+    in-out property <int> log-level-index: 1;
+
+    // ---- about
+    in property <string> licenses-text;
+
+    // ---- dialogs
+    in-out property <bool> close-hint-visible;
+
+    callback connect-toggled(bool);
+    callback source-selected(int);
+    callback latency-preset(int);
+    callback latency-custom-edited(int);
+    callback volume-enabled-toggled(bool);
+    callback volume-moved(float);
+    callback volume-released(float);
+    callback speaker-ip-accepted(string);
+    callback find-speakers();
+    callback scan-result-chosen(int);
+    callback start-with-windows-toggled(bool);
+    callback use-this-copy();
+    callback start-minimized-toggled(bool);
+    callback auto-connect-toggled(bool);
+    callback auto-update-toggled(bool);
+    callback check-updates();
+    callback install-update();
+    callback skip-update();
+    callback clock-selected(int);
+    callback codec-selected(int);
+    callback renderer-selected(int);
+    callback log-level-selected(int);
+    callback open-log-folder();
+    callback open-url(string);
+    callback close-hint-closed(bool);
+}

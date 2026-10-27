@@ -1,0 +1,291 @@
+// Main page: speaker card with the Connect switch and level meter, audio source,
+// latency, volume and a compact stats line.
+
+import { Button, ComboBox, ScrollView, Slider, SpinBox, Switch } from "std-widgets.slint";
+import { App, StatusKind } from "state.slint";
+import { Theme, Icons } from "theme.slint";
+import { Card, Caption, IconButton, InfoBar, LevelMeter, Segmented, SpeakerTile, StatusPill } from "controls.slint";
+
+export component MainPage inherits Rectangle {
+    // Index of the latency segment (5 = Custom).
+    pure function latency-segment(ms: int, custom: bool) -> int {
+        if custom {
+            return 5;
+        }
+        if ms == 100 {
+            return 0;
+        }
+        if ms == 250 {
+            return 1;
+        }
+        if ms == 500 {
+            return 2;
+        }
+        if ms == 1000 {
+            return 3;
+        }
+        if ms == 2000 {
+            return 4;
+        }
+        return 5;
+    }
+
+    ScrollView {
+        horizontal-scrollbar-policy: always-off;
+        VerticalLayout {
+            padding-left: Theme.page-padding;
+            padding-right: Theme.page-padding;
+            padding-top: 12px;
+            padding-bottom: Theme.page-padding;
+            spacing: 12px;
+            alignment: start;
+
+            // Header
+            HorizontalLayout {
+                spacing: 10px;
+                VerticalLayout {
+                    alignment: center;
+                    Image {
+                        source: @image-url("../assets/winpods-64.png");
+                        width: 24px;
+                        height: 24px;
+                        accessible-role: none;
+                    }
+                }
+                Text {
+                    text: "WinPods";
+                    color: Theme.text;
+                    font-size: Theme.subtitle;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                IconButton {
+                    icon: Icons.gear;
+                    label: "Settings";
+                    clicked => {
+                        App.page = 1;
+                    }
+                }
+            }
+
+            if App.update-available: InfoBar {
+                title: "WinPods " + App.update-version + " is available";
+                message: App.update-busy ? App.update-status : App.update-can-install ? "Installs in a few seconds; streaming resumes on its own." : "Download it from the release page.";
+                Button {
+                    text: App.update-can-install ? "Install & restart" : "Open release page";
+                    primary: true;
+                    enabled: !App.update-busy;
+                    clicked => {
+                        App.install-update();
+                    }
+                }
+            }
+
+            // Speaker
+            Card {
+                gap: 14px;
+                HorizontalLayout {
+                    spacing: 14px;
+                    VerticalLayout {
+                        alignment: center;
+                        SpeakerTile {
+                            kind: App.status-kind;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 4px;
+                        horizontal-stretch: 1;
+                        Text {
+                            text: App.speaker-name;
+                            color: Theme.text;
+                            font-size: 18px;
+                            font-weight: 600;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: App.speaker-detail;
+                            color: Theme.text-secondary;
+                            font-size: Theme.caption;
+                            overflow: elide;
+                        }
+                        HorizontalLayout {
+                            alignment: start;
+                            padding-top: 2px;
+                            StatusPill {
+                                text: App.status-text;
+                                kind: App.status-kind;
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Text {
+                            text: App.connect-on ? "On" : "Off";
+                            color: Theme.text;
+                            vertical-alignment: center;
+                            horizontal-alignment: right;
+                            min-width: 24px;
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Switch {
+                                checked <=> App.connect-on;
+                                accessible-label: "Connect";
+                                toggled => {
+                                    App.connect-toggled(self.checked);
+                                }
+                            }
+                        }
+                    }
+                }
+                if App.error-text != "": Text {
+                    text: App.error-text;
+                    color: Theme.error-text;
+                    font-size: Theme.caption;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 12px;
+                    Text {
+                        text: "Level";
+                        color: Theme.text-secondary;
+                        font-size: Theme.caption;
+                        vertical-alignment: center;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 1;
+                        LevelMeter {
+                            level: App.level;
+                        }
+                    }
+                }
+            }
+
+            // Audio source
+            Card {
+                gap: 8px;
+                Text {
+                    text: "Audio source";
+                    color: Theme.text;
+                    font-weight: 600;
+                }
+                ComboBox {
+                    model: App.sources;
+                    current-index <=> App.source-index;
+                    accessible-label: "Audio source";
+                    selected => {
+                        App.source-selected(self.current-index);
+                    }
+                }
+                Caption {
+                    text: App.capture-detail;
+                    overflow: elide;
+                    wrap: no-wrap;
+                }
+            }
+
+            // Latency
+            Card {
+                gap: 10px;
+                Text {
+                    text: "Latency";
+                    color: Theme.text;
+                    font-weight: 600;
+                }
+                Segmented {
+                    items: ["100 ms", "250 ms", "500 ms", "1 s", "2 s", "Custom"];
+                    selected: latency-segment(App.latency-ms, App.latency-custom);
+                    activated(index) => {
+                        if index == 5 {
+                            App.latency-custom = true;
+                        } else {
+                            App.latency-custom = false;
+                            App.latency-preset(index);
+                        }
+                    }
+                }
+                if App.latency-custom: HorizontalLayout {
+                    spacing: 10px;
+                    alignment: start;
+                    SpinBox {
+                        width: 132px;
+                        minimum: 75;
+                        maximum: 5000;
+                        step-size: 5;
+                        value <=> App.latency-ms;
+                        accessible-label: "Custom latency in milliseconds";
+                        edited(value) => {
+                            App.latency-custom-edited(value);
+                        }
+                    }
+                    Text {
+                        text: "ms";
+                        color: Theme.text-secondary;
+                        vertical-alignment: center;
+                    }
+                }
+                Caption {
+                    text: App.latency-hint;
+                    color: App.latency-warning ? Theme.warning-text : Theme.text-secondary;
+                }
+            }
+
+            // Volume
+            Card {
+                gap: 8px;
+                HorizontalLayout {
+                    spacing: 12px;
+                    Text {
+                        text: "Control speaker volume";
+                        color: Theme.text;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    Switch {
+                        checked <=> App.volume-enabled;
+                        accessible-label: "Control speaker volume";
+                        toggled => {
+                            App.volume-enabled-toggled(self.checked);
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 12px;
+                    Slider {
+                        minimum: 0;
+                        maximum: 100;
+                        step: 1;
+                        enabled: App.volume-enabled;
+                        value <=> App.volume;
+                        accessible-label: "Speaker volume";
+                        changed(value) => {
+                            App.volume-moved(value);
+                        }
+                        released(value) => {
+                            App.volume-released(value);
+                        }
+                    }
+                    Text {
+                        text: round(App.volume) + "%";
+                        color: App.volume-enabled ? Theme.text : Theme.text-tertiary;
+                        vertical-alignment: center;
+                        horizontal-alignment: right;
+                        min-width: 40px;
+                    }
+                }
+            }
+
+            if App.stats-text != "": Text {
+                text: App.stats-text;
+                color: Theme.text-tertiary;
+                font-size: Theme.caption;
+                horizontal-alignment: center;
+                overflow: elide;
+            }
+        }
+    }
+}
