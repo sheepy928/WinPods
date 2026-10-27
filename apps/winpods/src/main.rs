@@ -146,8 +146,9 @@ fn engine_settings(config: &Config) -> EngineSettings {
             .unwrap_or_else(|| "02:00:00:00:00:01".to_string()),
         test_tone: false,
         drop_every: None,
-        // The GUI falls back to a dynamic PTP port if 319/320 are taken.
-        require_standard_ptp_ports: false,
+        // HomePods reject SETUP (400) when we cannot listen on UDP 319/320, so report
+        // the busy ports clearly instead of trying the dynamic-port fallback.
+        require_standard_ptp_ports: true,
     }
 }
 
