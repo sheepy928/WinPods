@@ -651,7 +651,18 @@ pub fn codec_from_index(index: i32) -> Codec {
 }
 
 /// Config values of the renderer combo box, in order.
-pub const RENDERERS: [&str; 2] = ["auto", "software"];
+pub const RENDERERS: [&str; 2] = ["auto", "gpu"];
+
+/// Slint renderer for the `renderer` config value. "auto" (and "software", saved by
+/// older versions) is the software renderer: it draws this small window with less
+/// CPU than OpenGL and without the GPU driver's ~100 MB. "gpu" is OpenGL (femtovg).
+pub fn renderer_name(config_value: &str) -> &'static str {
+    if config_value.trim().eq_ignore_ascii_case("gpu") {
+        "femtovg"
+    } else {
+        "software"
+    }
+}
 /// Config values of the log level combo box, in order.
 pub const LOG_LEVELS: [&str; 4] = ["DEBUG", "INFO", "WARNING", "ERROR"];
 
@@ -1261,13 +1272,24 @@ mod tests {
         assert_eq!(codec_index("PCM"), 1);
         assert_eq!(codec_from_index(1), Codec::Pcm);
         assert_eq!(codec_from_index(7), Codec::Alac);
-        assert_eq!(option_index(&RENDERERS, "Software", 0), 1);
+        assert_eq!(option_index(&RENDERERS, "GPU", 0), 1);
+        // "software" from older versions is the default (software) renderer now.
+        assert_eq!(option_index(&RENDERERS, "software", 0), 0);
         assert_eq!(option_index(&RENDERERS, "weird", 0), 0);
         assert_eq!(option_index(&LOG_LEVELS, "warning", 1), 2);
         assert_eq!(option_index(&LOG_LEVELS, "", 1), 1);
         assert_eq!(option_value(&LOG_LEVELS, 0, 1), "DEBUG");
         assert_eq!(option_value(&LOG_LEVELS, 9, 1), "INFO");
         assert_eq!(option_value(&RENDERERS, -1, 0), "auto");
+    }
+
+    #[test]
+    fn software_renderer_unless_gpu_is_chosen() {
+        assert_eq!(renderer_name("auto"), "software");
+        assert_eq!(renderer_name("software"), "software");
+        assert_eq!(renderer_name(""), "software");
+        assert_eq!(renderer_name("GPU"), "femtovg");
+        assert_eq!(renderer_name(" gpu "), "femtovg");
     }
 
     #[test]

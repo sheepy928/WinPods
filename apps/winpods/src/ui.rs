@@ -117,13 +117,17 @@ pub fn run(ctx: UiContext) -> anyhow::Result<()> {
 
 /// [`run`] with presentation options (theme override for screenshots, start page).
 pub fn run_with(ctx: UiContext, options: RunOptions) -> anyhow::Result<()> {
-    if ctx.config.renderer.eq_ignore_ascii_case("software")
-        && let Err(err) = slint::BackendSelector::new()
+    // SLINT_BACKEND (e.g. "winit-femtovg") overrides the setting, for diagnostics.
+    let overridden = std::env::var_os("SLINT_BACKEND").is_some_and(|v| !v.is_empty());
+    if !overridden {
+        let renderer = view::renderer_name(&ctx.config.renderer);
+        if let Err(err) = slint::BackendSelector::new()
             .backend_name("winit".into())
-            .renderer_name("software".into())
+            .renderer_name(renderer.into())
             .select()
-    {
-        tracing::warn!("software renderer unavailable, using the default: {err}");
+        {
+            tracing::warn!("{renderer} renderer unavailable, using the default: {err}");
+        }
     }
 
     let window = MainWindow::new()?;
@@ -2342,6 +2346,140 @@ mod tests {
     #[test]
     fn notices_are_bundled() {
         assert!(THIRD_PARTY_NOTICES.contains("Slint"));
+    }
+
+    /// The parts the software renderer could not draw before (rounded gradients,
+    /// rounded clips, drop shadows), rendered by it and checked pixel by pixel.
+    mod software_rendering {
+        use std::rc::Rc;
+
+        use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
+        use slint::platform::{Platform, WindowAdapter};
+        use slint::{ComponentHandle, PhysicalSize, PlatformError, Rgb8Pixel};
+
+        #[allow(clippy::all, clippy::pedantic, missing_docs, unused_qualifications)]
+        mod harness {
+            slint::slint! {
+                #[style = "fluent"]
+                import { LevelMeter, SoftShadow, SpeakerTile } from "../ui/controls.slint";
+                import { StatusKind } from "../ui/state.slint";
+
+                export component Harness inherits Window {
+                    width: 420px;
+                    height: 140px;
+                    background: #ffffff;
+                    in property <float> level;
+                    LevelMeter {
+                        x: 10px;
+                        y: 10px;
+                        width: 400px;
+                        level: root.level;
+                    }
+                    SpeakerTile {
+                        x: 10px;
+                        y: 40px;
+                        kind: StatusKind.ok;
+                    }
+                    SoftShadow {
+                        x: 200px;
+                        y: 40px;
+                        width: 100px;
+                        height: 60px;
+                        strength: 0.3;
+                    }
+                    Rectangle {
+                        x: 200px;
+                        y: 40px;
+                        width: 100px;
+                        height: 60px;
+                        border-radius: 8px;
+                        background: #ffffff;
+                    }
+                }
+            }
+        }
+        use harness::Harness;
+
+        struct HeadlessPlatform(Rc<MinimalSoftwareWindow>);
+
+        impl Platform for HeadlessPlatform {
+            fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
+                Ok(self.0.clone())
+            }
+        }
+
+        const W: usize = 420;
+        const H: usize = 140;
+
+        fn render(window: &MinimalSoftwareWindow) -> Vec<Rgb8Pixel> {
+            let mut buffer = vec![Rgb8Pixel::default(); W * H];
+            window.request_redraw();
+            window.draw_if_needed(|renderer| {
+                renderer.render(&mut buffer, W);
+            });
+            buffer
+        }
+
+        fn rgb(buffer: &[Rgb8Pixel], x: usize, y: usize) -> [u8; 3] {
+            let p = buffer[y * W + x];
+            [p.r, p.g, p.b]
+        }
+
+        fn near(actual: [u8; 3], expected: [u8; 3]) -> bool {
+            actual.iter().zip(expected).all(|(a, e)| a.abs_diff(e) <= 6)
+        }
+
+        const GREEN: [u8; 3] = [0x2e, 0xaa, 0x4a];
+        const AMBER: [u8; 3] = [0xe0, 0xa0, 0x00];
+        const RED: [u8; 3] = [0xd0, 0x40, 0x40];
+        const WHITE: [u8; 3] = [0xff, 0xff, 0xff];
+
+        #[test]
+        fn meter_bands_tile_corners_and_shadow() {
+            let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+            slint::platform::set_platform(Box::new(HeadlessPlatform(window.clone())))
+                .expect("a fresh test thread has no Slint platform yet");
+            let ui = Harness::new().unwrap();
+            ui.show().unwrap();
+            window.set_size(PhysicalSize::new(W as u32, H as u32));
+
+            // Meter: x 10..410, rows 10..16; bands at 75 % (x 310) and 90 % (x 370).
+            ui.set_level(0.95);
+            let px = render(&window);
+            let mid = 13;
+            assert!(near(rgb(&px, 210, mid), GREEN), "{:?}", rgb(&px, 210, mid));
+            assert!(near(rgb(&px, 340, mid), AMBER), "{:?}", rgb(&px, 340, mid));
+            assert!(near(rgb(&px, 385, mid), RED), "{:?}", rgb(&px, 385, mid));
+            let track = rgb(&px, 400, mid);
+            assert!(!near(track, RED) && !near(track, WHITE), "track {track:?}");
+            // Rounded at both ends of the bar, square where the bands meet.
+            assert!(!near(rgb(&px, 10, 10), GREEN), "left end is rounded");
+            assert!(!near(rgb(&px, 389, 10), RED), "right end is rounded");
+            assert!(near(rgb(&px, 309, 10), GREEN) && near(rgb(&px, 311, 10), AMBER));
+
+            ui.set_level(0.5);
+            let px = render(&window);
+            assert!(near(rgb(&px, 200, mid), GREEN));
+            assert!(!near(rgb(&px, 209, 10), GREEN), "the bar's end is rounded");
+            assert!(!near(rgb(&px, 300, mid), AMBER) && !near(rgb(&px, 300, mid), GREEN));
+
+            // Speaker tile (52 px, radius 12 at 10,40): filled, with rounded corners.
+            let center = rgb(&px, 36, 66);
+            assert!(
+                center[1] > center[0] && center[1] > center[2],
+                "green {center:?}"
+            );
+            assert!(
+                near(rgb(&px, 10, 40), WHITE),
+                "corner {:?}",
+                rgb(&px, 10, 40)
+            );
+
+            // Shadow: darker than the background just below the surface, not above.
+            let below = rgb(&px, 250, 103);
+            assert!(below[0] < 245, "shadow below {below:?}");
+            assert!(near(rgb(&px, 250, 20), WHITE));
+        }
     }
 
     /// The custom-latency box on the main page: driven with real pointer and key

@@ -97,8 +97,8 @@ never changes firewall or other security settings.
   restarts (streaming resumes by itself). If WinPods runs from a folder it cannot
   write to, or from inside the zip, you get a link to the release page instead.
 * **Advanced**: clock protocol (PTP for HomePods; NTP for older AirPlay 2 speakers),
-  audio format (ALAC; PCM for speakers that need it), renderer (use *software* if the
-  window stays blank, e.g. over Remote Desktop), log level, log folder.
+  audio format (ALAC; PCM for speakers that need it), renderer (*software* by default;
+  *GPU* draws with OpenGL and needs about 100 MB more memory), log level, log folder.
 
 Settings live in `%APPDATA%\WinPods\config.json`, the log in
 `%APPDATA%\WinPods\winpods.log`.

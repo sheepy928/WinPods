@@ -54,7 +54,8 @@ pub struct Config {
     pub last_update_check: Option<u64>,
     /// The one-time "still running in the tray" hint was shown.
     pub close_hint_shown: bool,
-    /// "auto" or "software" (Slint renderer).
+    /// Slint renderer: "auto" (software) or "gpu" (OpenGL); "software", written by
+    /// older versions, means "auto".
     pub renderer: String,
 }
 

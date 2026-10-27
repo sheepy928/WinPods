@@ -3,7 +3,7 @@
 import { AboutSlint, Button, ComboBox, LineEdit, ScrollView, Spinner, TextEdit } from "std-widgets.slint";
 import { App, ScanRow } from "state.slint";
 import { Theme, Icons } from "theme.slint";
-import { Card, CardFrame, Caption, IconButton, InfoBar, Link, SectionTitle, SettingRow, SwitchRow } from "controls.slint";
+import { Card, CardFrame, Caption, IconButton, InfoBar, Link, SectionTitle, SettingRow, SoftShadow, SwitchRow } from "controls.slint";
 
 export component SettingsPage inherits Rectangle {
     property <int> about-request: App.about-request;
@@ -230,10 +230,10 @@ export component SettingsPage inherits Rectangle {
             }
             SettingRow {
                 title: "Renderer";
-                description: "Software fixes a blank window (after restart)";
+                description: "GPU needs about 100 MB more memory (after restart)";
                 ComboBox {
                     width: 120px;
-                    model: ["Automatic", "Software"];
+                    model: ["Software", "GPU"];
                     current-index <=> App.renderer-index;
                     accessible-label: "Renderer";
                     selected => {
@@ -337,15 +337,20 @@ export component SettingsPage inherits Rectangle {
         x: max(12px, min(root.width - self.width - 12px, find-button.absolute-position.x + find-button.width - self.width));
         y: find-button.absolute-position.y + find-button.height + 6px;
         width: min(340px, root.width - 24px);
+        height: find-card.preferred-height;
         close-policy: close-on-click-outside;
-        Rectangle {
+        SoftShadow {
+            width: parent.width;
+            height: parent.height;
+            strength: Theme.dark ? 0.4 : 0.14;
+        }
+        find-card := Rectangle {
+            width: parent.width;
+            height: parent.height;
             background: Theme.card-bg;
             border-radius: Theme.radius;
             border-width: 1px;
             border-color: Theme.dark ? #3a3a3a : #d8d8d8;
-            drop-shadow-blur: 18px;
-            drop-shadow-offset-y: 6px;
-            drop-shadow-color: Theme.dark ? #00000080 : #00000030;
             VerticalLayout {
                 padding: 12px;
                 spacing: 8px;

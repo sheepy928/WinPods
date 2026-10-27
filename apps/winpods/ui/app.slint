@@ -4,6 +4,7 @@
 import { Button, Palette } from "std-widgets.slint";
 import { App, ScanRow, StatusKind } from "state.slint";
 import { Theme } from "theme.slint";
+import { SoftShadow } from "controls.slint";
 import { MainPage } from "main-page.slint";
 import { SettingsPage } from "settings-page.slint";
 
@@ -14,6 +15,14 @@ component CloseHint inherits Rectangle {
     background: Theme.scrim;
     // Swallow clicks on the scrim.
     TouchArea { }
+    SoftShadow {
+        x: dialog.x;
+        y: dialog.y;
+        width: dialog.width;
+        height: dialog.height;
+        offset-y: 6px;
+        strength: 0.3;
+    }
     dialog := Rectangle {
         width: min(380px, root.width - 32px);
         height: content.preferred-height;
@@ -23,11 +32,9 @@ component CloseHint inherits Rectangle {
         border-radius: Theme.radius;
         border-width: 1px;
         border-color: Theme.dark ? #3d3d3d : #d9d9d9;
-        drop-shadow-blur: 32px;
-        drop-shadow-offset-y: 8px;
-        drop-shadow-color: #00000059;
-        clip: true;
+        // Inside the 1px border; the footer rounds its own bottom corners.
         content := VerticalLayout {
+            padding: 1px;
             VerticalLayout {
                 padding: 24px;
                 spacing: 12px;
@@ -47,6 +54,8 @@ component CloseHint inherits Rectangle {
             Rectangle {
                 background: Theme.dark ? #202020 : #f3f3f3;
                 border-width: 0;
+                border-bottom-left-radius: Theme.radius - 1px;
+                border-bottom-right-radius: Theme.radius - 1px;
                 HorizontalLayout {
                     padding: 24px;
                     padding-top: 20px;

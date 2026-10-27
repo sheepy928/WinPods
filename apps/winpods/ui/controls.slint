@@ -1,5 +1,9 @@
 // Small building blocks in the Windows 11 style: settings cards, status pill, level
 // meter, segmented selector, icon button, info bar.
+//
+// Everything here is drawn the same by the software renderer (the default) and the
+// GPU one: no drop shadows, no gradients on rounded shapes and no clipping that
+// relies on rounded corners, none of which the software renderer supports.
 
 import { Switch } from "std-widgets.slint";
 import { Theme, Icons } from "theme.slint";
@@ -169,13 +173,31 @@ export component StatusPill inherits Rectangle {
     }
 }
 
+// Soft shadow under a floating surface, built from translucent rounded layers (the
+// software renderer draws no drop shadows). Put it right before the surface, with the
+// same geometry.
+export component SoftShadow inherits Rectangle {
+    in property <length> radius: Theme.radius;
+    in property <length> offset-y: 4px;
+    /// Opacity of the darkest (innermost) part.
+    in property <float> strength: 0.16;
+    for spread in [12px, 9px, 6px, 3px, 1px]: Rectangle {
+        x: -spread;
+        y: -spread + root.offset-y;
+        width: root.width + 2 * spread;
+        height: root.height + 2 * spread;
+        border-radius: root.radius + spread;
+        background: #000000.with-alpha(root.strength / 5);
+    }
+}
+
 // Square tile with the speaker glyph, tinted with the connection state.
 export component SpeakerTile inherits Rectangle {
     in property <StatusKind> kind;
     width: 52px;
     height: 52px;
     border-radius: 12px;
-    background: @linear-gradient(160deg, Tones.fill(root.kind).brighter(0.18) 0%, Tones.fill(root.kind) 100%);
+    background: Tones.fill(root.kind);
     animate background { duration: 250ms; }
     Path {
         x: (parent.width - self.width) / 2;
@@ -203,26 +225,48 @@ export component SpeakerTile inherits Rectangle {
     }
 }
 
-// Horizontal level meter; the gradient is fixed to the track so colours mark levels.
+// Horizontal level meter. Its colour bands are fixed to the track (green, amber from
+// 75 %, red from 90 %), so colours mark levels; each band is a solid piece rounded
+// only at the bar's two ends.
 export component LevelMeter inherits Rectangle {
     in property <float> level;
+    property <float> shown: clamp(root.level, 0, 1);
+    property <float> amber-from: 0.75;
+    property <float> red-from: 0.9;
+    property <length> end-radius: root.height / 2;
     height: 6px;
-    border-radius: 3px;
+    border-radius: root.end-radius;
     background: Theme.meter-track;
     accessible-role: progress-indicator;
-    accessible-value: round(clamp(root.level, 0, 1) * 100) + "%";
+    accessible-value: round(root.shown * 100) + "%";
     Rectangle {
+        visible: root.shown > 0;
         x: 0;
-        width: clamp(root.level, 0, 1) * root.width;
+        width: min(root.shown, root.amber-from) * root.width;
         height: root.height;
-        border-radius: 3px;
-        clip: true;
-        Rectangle {
-            x: 0;
-            width: root.width;
-            height: root.height;
-            background: @linear-gradient(90deg, #2eaa4a 0%, #49b85a 60%, #e0a000 88%, #d04040 100%);
-        }
+        border-top-left-radius: min(root.end-radius, self.width / 2);
+        border-bottom-left-radius: self.border-top-left-radius;
+        border-top-right-radius: root.shown <= root.amber-from ? self.border-top-left-radius : 0;
+        border-bottom-right-radius: self.border-top-right-radius;
+        background: #2eaa4a;
+    }
+    Rectangle {
+        visible: root.shown > root.amber-from;
+        x: root.amber-from * root.width;
+        width: max(0, min(root.shown, root.red-from) - root.amber-from) * root.width;
+        height: root.height;
+        border-top-right-radius: root.shown <= root.red-from ? min(root.end-radius, self.width) : 0;
+        border-bottom-right-radius: self.border-top-right-radius;
+        background: #e0a000;
+    }
+    Rectangle {
+        visible: root.shown > root.red-from;
+        x: root.red-from * root.width;
+        width: max(0, root.shown - root.red-from) * root.width;
+        height: root.height;
+        border-top-right-radius: min(root.end-radius, self.width);
+        border-bottom-right-radius: self.border-top-right-radius;
+        background: #d04040;
     }
 }
 
