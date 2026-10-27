@@ -979,8 +979,11 @@ async fn closed_connection_sets_end_reason() {
     mock.finish().await;
 }
 
+/// pyatv only logs failed feedback requests. A receiver that answers POST /feedback
+/// with an error status is still there, so the session must keep going (it used to
+/// end after the third error status).
 #[tokio::test]
-async fn failing_feedback_ends_the_session() {
+async fn rejected_feedback_does_not_end_the_session() {
     let mock = MockReceiver::start(MockOptions {
         feedback_status: 500,
         ..Default::default()
@@ -997,21 +1000,25 @@ async fn failing_feedback_ends_the_session() {
         .start_playback(&params)
         .await
         .expect("feedback errors do not fail playback");
-    assert!(session.end_reason().is_none());
-    let reason = tokio::time::timeout(Duration::from_secs(8), async {
-        loop {
-            if let Some(reason) = session.end_reason() {
-                return reason;
-            }
+    // More rejected feedbacks than FEEDBACK_FAILURE_LIMIT (one every 2 s).
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while mock.names().iter().filter(|n| *n == "feedback").count() < 4 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("end reason after three failures");
-    assert!(reason.contains("feedback"), "{reason}");
-    assert_eq!(mock.names().iter().filter(|n| *n == "feedback").count(), 3);
+    .expect("four feedback requests");
+    // Let the fourth response be handled before looking.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(session.end_reason(), None);
     assert!(session.last_feedback().is_none());
+    // The session still works.
+    session
+        .set_volume(30.0)
+        .await
+        .expect("volume after rejected feedback");
     session.teardown().await;
+    assert!(mock.names().contains(&"teardown".to_string()));
     mock.finish().await;
 }
 

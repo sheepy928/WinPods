@@ -1,10 +1,17 @@
 //! winpods-cli.exe: command-line diagnostics. Port of `legacy/python/winpods/cli.py`.
 //!
 //! Command-line overrides apply to this run only: the CLI never saves its in-memory
-//! config (it only persists the generated device id and the discovered speaker name).
+//! config (it only persists the discovered name of the saved speaker; the device id
+//! is persisted by `Config::load`).
+//!
+//! Ctrl+C, closing the console window, log-off and shutdown all stop the stream with
+//! a TEARDOWN: the console handler holds the close/log-off/shutdown events (which
+//! end the process once the handler returns) until the engine has shut down.
 
+use std::future::Future;
 use std::net::Ipv4Addr;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -17,10 +24,20 @@ use winpods_airplay::{Codec, MAX_LATENCY_MS, MIN_LATENCY_MS, TimingProtocol, mdn
 use winpods_app::Config;
 use winpods_app::logging;
 use winpods_audio::{DeviceKind, DeviceWatch};
+use winpods_engine::connect::{LOOKUP_TIMEOUT, route_local_ip, start_ptp};
 use winpods_engine::supervisor::capture_selection;
 use winpods_engine::{
     CaptureSelection, Command, EngineApi, EngineHandle, EngineSettings, Snapshot, State,
 };
+
+/// `println!` that ignores a console that is going away: closing the window must
+/// not panic the thread that still has to shut the stream down.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
 
 /// Stream Windows audio to a HomePod / AirPlay 2 speaker (diagnostics CLI).
 #[derive(Debug, Parser)]
@@ -71,6 +88,23 @@ pub struct Args {
 }
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+/// Set once the engine (or the pair-test session) has shut down, TEARDOWN included.
+static CLEANED_UP: AtomicBool = AtomicBool::new(false);
+/// How long the console handler holds a close/log-off/shutdown event for cleanup.
+/// Windows ends the process about 5 s after such an event.
+const CLOSE_GRACE: Duration = Duration::from_millis(4500);
+/// How often a pair-test step checks for Ctrl+C.
+const INTERRUPT_POLL: Duration = Duration::from_millis(50);
+
+/// Marks cleanup as finished when dropped. Declare it before the engine/session so
+/// it is dropped after them.
+struct CleanupSignal;
+
+impl Drop for CleanupSignal {
+    fn drop(&mut self) {
+        CLEANED_UP.store(true, Ordering::SeqCst);
+    }
+}
 
 fn main() -> ExitCode {
     winpods_rt::clock::init();
@@ -183,15 +217,24 @@ fn pair_test(args: &Args, config: &Config) -> Result<ExitCode> {
     let Some(address) = parse_ip(&settings.device_ip) else {
         return Ok(no_address());
     };
+    install_console_handler();
+    // Dropped last: the console handler waits for it (after the TEARDOWN below).
+    let _cleanup = CleanupSignal;
+    // Preflight before the receiver is contacted. HomePods reject the dynamic-port
+    // fallback (ClockPorts), so busy PTP ports are an error, as in the run mode.
+    let route_ip =
+        route_local_ip(address).with_context(|| format!("no network route to {address}"))?;
+    let mut ptp = Some(start_ptp(route_ip, true).map_err(|err| anyhow!(err))?);
+    let persist_name = name_belongs_to_saved_speaker(args.ip.as_deref(), &config.device_ip);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?;
     runtime.block_on(async move {
-        let info = mdns::lookup(address, Duration::from_secs(5))
-            .await?
+        let info = interruptible(mdns::lookup(address, LOOKUP_TIMEOUT))
+            .await??
             .ok_or_else(|| anyhow!("no AirPlay receiver answered at {address}"))?;
-        println!(
+        say!(
             "receiver: {} [{}] features={:#x} airplay2={} transient={}",
             info.name,
             info.model,
@@ -207,48 +250,86 @@ fn pair_test(args: &Args, config: &Config) -> Result<ExitCode> {
             volume_pct: None,
             title: "Windows audio".into(),
         };
-        let mut session = Session::connect(&info, session_config).await?;
-        println!(
+        let mut session = interruptible(Session::connect(&info, session_config)).await??;
+        say!(
             "paired (retries: {}), local address {}",
             session.pairing_retries(),
             session.local_ip()
         );
-        let control = ControlSocket::bind(session.local_ip())?;
-        let ptp = PtpService::start(session.local_ip())?;
-        if !ptp.standard_ports() {
-            println!("warning: UDP 319/320 are in use; using port {}", ptp.port());
-        }
-        let result = session
-            .setup(TimingSetup::Ptp(ptp.clone()), control.port())
-            .await;
-        match &result {
-            Ok(params) => {
-                println!(
-                    "SETUP ok: data port {}, control port {}, render {:?} ms, clock {:?}",
-                    params.data_port,
-                    params.control_port,
-                    params.render_ms,
-                    params.clock_id.map(|c| format!("{c:016x}"))
-                );
-                let clock = ptp.clock();
-                println!(
-                    "PTP locked={} offset={:.3} ms spread={:.2} ms syncs={}",
-                    clock.locked(),
-                    clock.offset_ns().unwrap_or(0.0) / 1e6,
-                    clock.delay_spread_ns() as f64 / 1e6,
-                    clock.syncs()
-                );
-            }
-            Err(err) => println!("SETUP failed: {err}"),
-        }
+        // From here on the session is always torn down, Ctrl+C included.
+        let result = setup_test(&mut session, route_ip, &mut ptp).await;
         session.teardown().await;
-        if let Err(err) = Config::persist_identity(&settings.device_id, &info.name) {
+        if persist_name && let Err(err) = Config::persist_identity(&settings.device_id, &info.name)
+        {
             tracing::debug!("could not persist identity: {err}");
         }
-        result
-            .map(|_| ExitCode::SUCCESS)
-            .map_err(anyhow::Error::from)
+        result.map(|()| ExitCode::SUCCESS)
     })
+}
+
+/// Bind the sockets and run SETUP on a paired session (pair-test).
+async fn setup_test(
+    session: &mut Session,
+    route_ip: Ipv4Addr,
+    ptp: &mut Option<Arc<PtpService>>,
+) -> Result<()> {
+    let local_ip = session.local_ip();
+    if local_ip != route_ip {
+        say!("note: the receiver connection uses {local_ip}, not {route_ip}; moving PTP there");
+        *ptp = None; // release 319/320 before binding them again
+        *ptp = Some(start_ptp(local_ip, true).map_err(|err| anyhow!(err))?);
+    }
+    let ptp = ptp.as_ref().context("PTP follower missing")?;
+    let control = ControlSocket::bind(local_ip)?;
+    let result =
+        interruptible(session.setup(TimingSetup::Ptp(ptp.clone()), control.port())).await?;
+    match &result {
+        Ok(params) => {
+            say!(
+                "SETUP ok: data port {}, control port {}, render {:?} ms, clock {:?}",
+                params.data_port,
+                params.control_port,
+                params.render_ms,
+                params.clock_id.map(|c| format!("{c:016x}"))
+            );
+            let clock = ptp.clock();
+            say!(
+                "PTP locked={} offset={:.3} ms spread={:.2} ms syncs={}",
+                clock.locked(),
+                clock.offset_ns().unwrap_or(0.0) / 1e6,
+                clock.delay_spread_ns() as f64 / 1e6,
+                clock.syncs()
+            );
+        }
+        Err(err) => say!("SETUP failed: {err}"),
+    }
+    result.map(|_| ()).map_err(anyhow::Error::from)
+}
+
+/// Run `step` unless Ctrl+C (or a console close) comes first.
+async fn interruptible<F: Future>(step: F) -> Result<F::Output> {
+    tokio::select! {
+        biased;
+        () = async {
+            while !INTERRUPTED.load(Ordering::SeqCst) {
+                tokio::time::sleep(INTERRUPT_POLL).await;
+            }
+        } => Err(anyhow!("interrupted")),
+        out = step => Ok(out),
+    }
+}
+
+/// True when the speaker the engine connects to is the saved one, so its
+/// discovered name may be saved as the config's speaker name (`--ip` pointing
+/// somewhere else must not rename the saved speaker).
+fn name_belongs_to_saved_speaker(ip_override: Option<&str>, saved_ip: &str) -> bool {
+    match ip_override {
+        None => true,
+        Some(ip) => matches!(
+            (parse_ip(ip), parse_ip(saved_ip)),
+            (Some(given), Some(saved)) if given == saved
+        ),
+    }
 }
 
 fn run(args: &Args, config: &Config) -> Result<ExitCode> {
@@ -256,18 +337,22 @@ fn run(args: &Args, config: &Config) -> Result<ExitCode> {
     if parse_ip(&settings.device_ip).is_none() {
         return Ok(no_address());
     }
-    install_ctrl_c();
+    install_console_handler();
+    // Dropped after `engine` (declared later): the console handler waits for it.
+    let _cleanup = CleanupSignal;
     let source = if settings.test_tone {
         "a test tone"
     } else {
         "Windows audio"
     };
-    println!(
+    say!(
         "Streaming {source} to {} with {} ms latency. Ctrl+C to stop.",
-        settings.device_ip, settings.latency_ms
+        settings.device_ip,
+        settings.latency_ms
     );
     let device_id = settings.device_id.clone();
     let drop_test = settings.drop_every.is_some();
+    let persist_name = name_belongs_to_saved_speaker(args.ip.as_deref(), &config.device_ip);
     let engine = EngineHandle::start(settings)?;
     engine.send(Command::Connect);
 
@@ -288,9 +373,12 @@ fn run(args: &Args, config: &Config) -> Result<ExitCode> {
             } else {
                 format!(" - {}", snap.error)
             };
-            println!("[{}]{detail}", snap.state.label());
+            say!("[{}]{detail}", snap.state.label());
         }
-        if !persisted_name && let Some(name) = &snap.discovered_device_name {
+        if persist_name
+            && !persisted_name
+            && let Some(name) = &snap.discovered_device_name
+        {
             persisted_name = true;
             if let Err(err) = Config::persist_identity(&device_id, name) {
                 tracing::debug!("could not persist identity: {err}");
@@ -299,14 +387,14 @@ fn run(args: &Args, config: &Config) -> Result<ExitCode> {
         let now = Instant::now();
         if snap.state == State::Streaming && now >= next_stats {
             next_stats = now + Duration::from_secs(5);
-            println!("{}", stats_line(&snap, engine.peak(), drop_test));
+            say!("{}", stats_line(&snap, engine.peak(), drop_test));
         }
         if now >= next_feedback {
             next_feedback = now + Duration::from_secs(15);
             if snap.state == State::Streaming
                 && let Some(feedback) = &snap.feedback
             {
-                println!("  receiver feedback: {feedback}");
+                say!("  receiver feedback: {feedback}");
             }
         }
         if snap.state == State::Error {
@@ -321,13 +409,15 @@ fn run(args: &Args, config: &Config) -> Result<ExitCode> {
             break;
         }
     }
-    println!("Stopping...");
+    say!("Stopping...");
     let final_snap = engine.snapshot();
     engine.shutdown();
     if drop_test {
-        println!(
+        say!(
             "drop test: withheld={} retransmit_requests={} retransmitted={}",
-            final_snap.withheld, final_snap.retransmit_requests, final_snap.retransmitted
+            final_snap.withheld,
+            final_snap.retransmit_requests,
+            final_snap.retransmitted
         );
     }
     Ok(ExitCode::SUCCESS)
@@ -379,13 +469,45 @@ fn no_address() -> ExitCode {
     ExitCode::from(2)
 }
 
-fn install_ctrl_c() {
+/// Close, log-off and shutdown end the process as soon as the handler returns.
+fn ends_process(ctrl_type: u32) -> bool {
+    use windows::Win32::System::Console::{
+        CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+    matches!(
+        ctrl_type,
+        CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT
+    )
+}
+
+/// Wait until `flag` is set or `limit` has passed; true when it was set.
+fn wait_for_flag(flag: &AtomicBool, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        if flag.load(Ordering::SeqCst) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(20)));
+    }
+}
+
+fn install_console_handler() {
     use windows::Win32::Foundation::TRUE;
     use windows::Win32::System::Console::SetConsoleCtrlHandler;
     use windows::core::BOOL;
 
-    unsafe extern "system" fn handler(_ctrl_type: u32) -> BOOL {
+    /// Runs on a thread Windows creates for the event.
+    unsafe extern "system" fn handler(ctrl_type: u32) -> BOOL {
         INTERRUPTED.store(true, Ordering::SeqCst);
+        if ends_process(ctrl_type) {
+            // Hold the event until the main thread has sent TEARDOWN and stopped
+            // the engine, within the time Windows allows.
+            wait_for_flag(&CLEANED_UP, CLOSE_GRACE);
+        }
         TRUE
     }
     unsafe {
@@ -396,4 +518,95 @@ fn install_ctrl_c() {
 #[allow(dead_code)]
 fn _assert_selection_default() -> CaptureSelection {
     CaptureSelection::default_output()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speaker_name_is_saved_only_for_the_saved_address() {
+        assert!(name_belongs_to_saved_speaker(None, "192.168.1.57"));
+        assert!(name_belongs_to_saved_speaker(None, ""));
+        assert!(name_belongs_to_saved_speaker(
+            Some(" 192.168.1.57 "),
+            "192.168.1.57"
+        ));
+        assert!(!name_belongs_to_saved_speaker(
+            Some("192.168.1.80"),
+            "192.168.1.57"
+        ));
+        // Nothing saved yet, or garbage: do not invent a name for the config.
+        assert!(!name_belongs_to_saved_speaker(Some("192.168.1.80"), ""));
+        assert!(!name_belongs_to_saved_speaker(Some("kitchen"), "kitchen"));
+    }
+
+    #[test]
+    fn close_logoff_and_shutdown_are_held_for_cleanup() {
+        use windows::Win32::System::Console::{
+            CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT,
+            CTRL_SHUTDOWN_EVENT,
+        };
+        assert!(ends_process(CTRL_CLOSE_EVENT));
+        assert!(ends_process(CTRL_LOGOFF_EVENT));
+        assert!(ends_process(CTRL_SHUTDOWN_EVENT));
+        assert!(!ends_process(CTRL_C_EVENT));
+        assert!(!ends_process(CTRL_BREAK_EVENT));
+    }
+
+    #[test]
+    fn handler_wait_ends_when_cleanup_finishes_or_the_grace_runs_out() {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        let setter = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(100));
+            DONE.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        assert!(wait_for_flag(&DONE, Duration::from_secs(5)));
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(90), "{waited:?}");
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+        setter.join().unwrap();
+
+        let never = AtomicBool::new(false);
+        let started = Instant::now();
+        assert!(!wait_for_flag(&never, Duration::from_millis(150)));
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(
+            CLOSE_GRACE < Duration::from_secs(5),
+            "inside Windows' limit"
+        );
+    }
+
+    #[test]
+    fn cleanup_signal_fires_on_drop() {
+        // The only test touching CLEANED_UP.
+        CLEANED_UP.store(false, Ordering::SeqCst);
+        {
+            let _cleanup = CleanupSignal;
+            assert!(!CLEANED_UP.load(Ordering::SeqCst));
+        }
+        assert!(CLEANED_UP.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn interrupted_steps_stop_and_others_finish() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // The only test touching INTERRUPTED.
+            INTERRUPTED.store(false, Ordering::SeqCst);
+            assert_eq!(interruptible(async { 5 }).await.unwrap(), 5);
+            INTERRUPTED.store(true, Ordering::SeqCst);
+            let started = Instant::now();
+            let err = interruptible(std::future::pending::<()>())
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("interrupted"), "{err}");
+            assert!(started.elapsed() < Duration::from_secs(1));
+            INTERRUPTED.store(false, Ordering::SeqCst);
+        });
+    }
 }

@@ -4,6 +4,7 @@
 //! The UI and CLI talk to it only through [`EngineApi`] (commands in, snapshots out),
 //! so the GUI can be developed and screenshot against a mock.
 
+pub mod connect;
 pub mod scan;
 pub mod supervisor;
 pub mod types;
