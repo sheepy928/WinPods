@@ -175,19 +175,20 @@ export component StatusPill inherits Rectangle {
 
 // Soft shadow under a floating surface, built from translucent rounded layers (the
 // software renderer draws no drop shadows). Put it right before the surface, with the
-// same geometry.
+// same geometry. Sixteen layers 1px apart fade it linearly over 16px, in steps too
+// fine to show as bands.
 export component SoftShadow inherits Rectangle {
     in property <length> radius: Theme.radius;
-    in property <length> offset-y: 4px;
-    /// Opacity of the darkest (innermost) part.
-    in property <float> strength: 0.16;
-    for spread in [12px, 9px, 6px, 3px, 1px]: Rectangle {
+    in property <length> offset-y: 8px;
+    /// Opacity right at the surface's edge.
+    in property <float> strength: 0.1;
+    for spread in [16px, 15px, 14px, 13px, 12px, 11px, 10px, 9px, 8px, 7px, 6px, 5px, 4px, 3px, 2px, 1px]: Rectangle {
         x: -spread;
         y: -spread + root.offset-y;
         width: root.width + 2 * spread;
         height: root.height + 2 * spread;
         border-radius: root.radius + spread;
-        background: #000000.with-alpha(root.strength / 5);
+        background: #000000.with-alpha(root.strength / 16);
     }
 }
 

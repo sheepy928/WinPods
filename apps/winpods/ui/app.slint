@@ -21,8 +21,8 @@ component CloseHint inherits Rectangle {
         y: dialog.y;
         width: dialog.width;
         height: dialog.height;
-        offset-y: 6px;
-        strength: 0.3;
+        // Was drop-shadow 32px blur, 8px down, 35 % black.
+        strength: 0.22;
     }
     dialog := Rectangle {
         width: min(380px, root.width - 32px);

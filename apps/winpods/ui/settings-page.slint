@@ -343,7 +343,9 @@ export component SettingsPage inherits Rectangle {
         SoftShadow {
             width: parent.width;
             height: parent.height;
-            strength: Theme.dark ? 0.4 : 0.14;
+            // Was drop-shadow 18px blur, 6px down, 50 % / 19 % black.
+            offset-y: 6px;
+            strength: Theme.dark ? 0.3 : 0.11;
         }
         find-card := Rectangle {
             width: parent.width;

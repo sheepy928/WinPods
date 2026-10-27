@@ -2548,6 +2548,30 @@ mod tests {
             let shadow = rgb(&px, 300, 108);
             assert!(shadow[0] < 250, "shadow below the open list: {shadow:?}");
             assert!(near(rgb(&px, below.0, below.1 + 15), WHITE));
+
+            // The accent pill (x 207..210) marks the row Return would choose: the
+            // current one when the list opens (row 0, centre y 40), then the row the
+            // arrow key moved to (row 1, centre y 80).
+            let is_accent = |p: [u8; 3]| p[2] > 120 && p[0] < 60;
+            assert!(
+                is_accent(rgb(&px, 208, 40)),
+                "pill on row 0: {:?}",
+                rgb(&px, 208, 40)
+            );
+            assert!(!is_accent(rgb(&px, 208, 80)));
+            let down: slint::SharedString = slint::platform::Key::DownArrow.into();
+            ui.window()
+                .dispatch_event(WindowEvent::KeyPressed { text: down.clone() });
+            ui.window()
+                .dispatch_event(WindowEvent::KeyReleased { text: down });
+            slint::platform::update_timers_and_animations();
+            let px = render(&window);
+            assert!(
+                is_accent(rgb(&px, 208, 80)),
+                "pill on row 1: {:?}",
+                rgb(&px, 208, 80)
+            );
+            assert!(!is_accent(rgb(&px, 208, 40)));
         }
     }
 
@@ -3009,6 +3033,65 @@ mod tests {
             assert!(!ui.get_expanded());
             assert_eq!(ui.get_opened(), 2);
             assert_eq!(ui.get_index(), 1);
+        }
+
+        #[test]
+        fn a_list_rebuilt_while_open_keeps_return_on_the_current_choice() {
+            let d = Driver::new();
+            let ui = &d.ui;
+            d.set_sources(&["Default", "Speakers", "Mic"]);
+            ui.set_index(2);
+
+            // Opened from the keyboard; then a device appears before the current one
+            // and the host moves the index with it (as rebuild_sources does).
+            d.key(Key::Tab);
+            d.key(Key::Return);
+            assert!(ui.get_expanded());
+            // Model first, then index, with no event processing in between, as
+            // rebuild_sources does.
+            let rows: Vec<slint::SharedString> =
+                ["Default", "Speakers", "USB headset", "Mic", "USB mic"]
+                    .iter()
+                    .map(|n| (*n).into())
+                    .collect();
+            ui.set_sources(slint::ModelRc::new(slint::VecModel::from(rows)));
+            ui.set_index(3);
+            slint::platform::update_timers_and_animations();
+            assert!(ui.get_expanded());
+
+            // Return keeps "Mic" (now row 3), not whatever row 2 has become.
+            d.key(Key::Return);
+            assert!(!ui.get_expanded());
+            assert_eq!(ui.get_index(), 3);
+            assert_eq!(ui.get_picked(), 3);
+
+            // Down from there goes to the row below the current one.
+            d.key(Key::Return);
+            d.key(Key::DownArrow);
+            d.key(Key::Return);
+            assert_eq!(ui.get_index(), 4);
+        }
+
+        #[test]
+        fn arrow_keys_keep_the_highlight_in_view_after_the_wheel_moved_the_list() {
+            let d = Driver::new();
+            let ui = &d.ui;
+            let names: Vec<String> = (0..10).map(|i| format!("Device {i}")).collect();
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            d.set_sources(&names);
+
+            // Ten rows, six shown. The wheel inside the open list scrolls it, which
+            // ends the content-y binding; the arrow keys must still reveal their row.
+            d.click(COMBO);
+            d.wheel(row(1.0), -40.0);
+            d.wheel(row(1.0), 40.0);
+            for _ in 0..9 {
+                d.key(Key::DownArrow);
+            }
+            // Rows 4..9 are in view now, so the top visible row is row 4.
+            d.click(row(0.0));
+            assert!(!ui.get_expanded());
+            assert_eq!(ui.get_index(), 4);
         }
 
         #[test]
