@@ -5,14 +5,19 @@
 //!   `WinPods/<version>`.
 //! * `check`: GET `https://api.github.com/repos/<repo>/releases/latest` (Accept
 //!   `application/vnd.github+json`, X-GitHub-Api-Version). Newer semver tag than the
-//!   running version and not skipped → `Some(Release)`. Missing assets → `None`.
+//!   running version and not skipped → `Some(Release)`. Missing assets → `None`:
+//!   a release without `WinPods.exe` or `SHA256SUMS.txt` is "no update yet". A
+//!   missing `SHA256SUMS.txt.minisig` does not hide the release (plan §0.2: CI
+//!   publishes unsigned releases until the signing secrets exist); it is returned
+//!   with [`Release::is_signed`] false so the UI can offer "open release page".
 //! * `stage`: download `SHA256SUMS.txt` and `SHA256SUMS.txt.minisig` (≤ 1 MB), verify
 //!   with one of `update_key::UPDATE_PUBLIC_KEYS`; the trusted comment must be
 //!   `WinPods <tag> windows-x64` and the tag newer than the running version (blocks
 //!   downgrades). Then stream `WinPods.exe` (and `winpods-cli.exe` if it sits next to
 //!   the exe) to `<name>.new`, hashing while downloading; size must equal the API size
-//!   and SHA-256 must match the SHA256SUMS line. No signature → error (UI then only
-//!   offers "open release page").
+//!   and SHA-256 must match the SHA256SUMS line. No signature (missing, invalid, or
+//!   no built-in key) → [`UpdateError::Signature`] (UI then only offers "open
+//!   release page").
 //! * `install`: rename swap while still running: `exe → exe.old`, `exe.new → exe`
 //!   (retry ~10 s on sharing violations); on failure rename back and keep running.
 //!   The caller then hands off (`WinPods.exe --post-update <pid>`) and exits.
@@ -75,6 +80,15 @@ pub struct Release {
     pub notes: String,
     /// Download URLs and sizes from the release assets.
     pub assets: Vec<ReleaseAsset>,
+}
+
+impl Release {
+    /// True when the release carries [`SIG_ASSET`]. Whether that signature verifies is
+    /// only known after [`Updater::stage`]; an unsigned release can only be offered as
+    /// "open release page".
+    pub fn is_signed(&self) -> bool {
+        find_asset(self, SIG_ASSET).is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,12 +253,13 @@ impl Updater {
             )));
         }
 
-        // 1. Signed checksums.
-        let sums_asset = find_asset(release, SUMS_ASSET)
-            .ok_or_else(|| UpdateError::Integrity(format!("the release has no {SUMS_ASSET}")))?;
+        // 1. Signed checksums. An unsigned release is a signature error first, whatever
+        //    else it lacks, so the UI falls back to "open release page".
         let sig_asset = find_asset(release, SIG_ASSET).ok_or_else(|| {
             UpdateError::Signature(format!("the release has no {SIG_ASSET} (unsigned)"))
         })?;
+        let sums_asset = find_asset(release, SUMS_ASSET)
+            .ok_or_else(|| UpdateError::Integrity(format!("the release has no {SUMS_ASSET}")))?;
         let sums = self.fetch_small(&sums_asset.url)?;
         let sig = self.fetch_small(&sig_asset.url)?;
         let sig = String::from_utf8(sig)
@@ -611,7 +626,12 @@ fn is_skipped(tag: &str, skipped: Option<&str>) -> bool {
 }
 
 /// Offer `parsed` only when it is a final release, newer than `current`, not skipped,
-/// and carries every required asset.
+/// and carries the executable and its checksums (without them it is still uploading or
+/// not meant for in-app updates: "no update yet").
+///
+/// A missing signature does not hide the release: it is offered as unsigned
+/// ([`Release::is_signed`] is false), the UI can only open its page, and
+/// [`Updater::stage`] refuses it with [`UpdateError::Signature`].
 fn evaluate(parsed: ParsedRelease, current: &Version, skipped: Option<&str>) -> Option<Release> {
     let release = parsed.release;
     if parsed.draft || parsed.prerelease {
@@ -626,7 +646,7 @@ fn evaluate(parsed: ParsedRelease, current: &Version, skipped: Option<&str>) -> 
         tracing::info!("update check: {} is skipped by the user", release.tag);
         return None;
     }
-    let missing: Vec<&str> = [GUI_ASSET, SUMS_ASSET, SIG_ASSET]
+    let missing: Vec<&str> = [GUI_ASSET, SUMS_ASSET]
         .into_iter()
         .filter(|name| find_asset(&release, name).is_none())
         .collect();
@@ -637,6 +657,12 @@ fn evaluate(parsed: ParsedRelease, current: &Version, skipped: Option<&str>) -> 
             missing.join(", ")
         );
         return None;
+    }
+    if !release.is_signed() {
+        tracing::warn!(
+            "update check: {} has no {SIG_ASSET}; only its release page can be offered",
+            release.tag
+        );
     }
     Some(release)
 }

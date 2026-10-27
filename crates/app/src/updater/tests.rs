@@ -349,12 +349,41 @@ fn check_honours_the_skipped_version() {
 }
 
 #[test]
-fn check_treats_missing_assets_as_no_update_yet() {
+fn check_treats_missing_payload_assets_as_no_update_yet() {
+    for keep in [vec![SUMS_ASSET, SIG_ASSET], vec![GUI_ASSET, SIG_ASSET]] {
+        let fx = Fixture::new();
+        let mut spec = Spec::new("v0.3.0");
+        spec.assets = Some(keep.clone());
+        fx.publish(spec);
+        assert_eq!(fx.updater().check(None).unwrap(), None, "{keep:?}");
+    }
+}
+
+#[test]
+fn check_offers_an_unsigned_release_that_stage_refuses() {
+    // Plan §0.2: until the signing secrets exist CI publishes without the .minisig;
+    // the UI must still learn about the release to offer "open release page".
     let fx = Fixture::new();
     let mut spec = Spec::new("v0.3.0");
-    spec.assets = Some(vec![GUI_ASSET, SUMS_ASSET]); // signature not uploaded yet
+    spec.assets = Some(vec![GUI_ASSET, SUMS_ASSET]);
     fx.publish(spec);
-    assert_eq!(fx.updater().check(None).unwrap(), None);
+    let updater = fx.updater();
+    let release = updater.check(None).unwrap().expect("an unsigned update");
+    assert!(!release.is_signed());
+    assert_eq!(release.version, Version::new(0, 3, 0));
+
+    let msg = expect_signature_error(updater.stage(&release, &no_progress));
+    assert!(msg.contains("unsigned"), "{msg}");
+    assert!(fx.staged_files().is_empty());
+    assert_eq!(fs::read(fx.exe()).unwrap(), OLD_EXE);
+    assert!(
+        !fx.server.requests().iter().any(|r| r.contains("/dl/")),
+        "nothing is downloaded for an unsigned release"
+    );
+
+    // A complete release reports its signature asset.
+    let signed = fx.publish(Spec::new("v0.3.0"));
+    assert!(signed.is_signed());
 }
 
 #[test]
@@ -607,6 +636,16 @@ fn stage_reports_missing_assets() {
     };
     let updater = fx.updater();
     expect_signature_error(updater.stage(&without(SIG_ASSET), &no_progress));
+    // unsigned wins over the missing checksums (UI: "open release page")
+    let bare = Release {
+        assets: without(SIG_ASSET)
+            .assets
+            .into_iter()
+            .filter(|a| a.name != SUMS_ASSET)
+            .collect(),
+        ..full.clone()
+    };
+    expect_signature_error(updater.stage(&bare, &no_progress));
     expect_integrity_error(updater.stage(&without(SUMS_ASSET), &no_progress));
     expect_integrity_error(updater.stage(&without(GUI_ASSET), &no_progress));
 
