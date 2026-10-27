@@ -58,6 +58,8 @@ pub struct StreamStats {
     pub send_errors: u64,
     /// Packets held back by the `drop_every` diagnostic.
     pub withheld: u64,
+    /// Frames waiting in the ring (sampled by the sender each loop).
+    pub ring_frames: u64,
     /// `rt::mono_ns()` when the stream started.
     pub started_ns: u64,
 }
@@ -81,13 +83,14 @@ impl StreamHandle {
     }
 }
 
-/// Start the control and sender threads for a negotiated stream.
+/// Start the control and sender threads for a negotiated stream. On failure the ring
+/// consumer is handed back so the engine can retry with the same ring.
 pub fn start(
     params: &StreamParams,
     control: ControlSocket,
     consumer: RingConsumer,
     options: RuntimeOptions,
-) -> std::io::Result<StreamHandle> {
+) -> Result<StreamHandle, (std::io::Error, RingConsumer)> {
     let _ = (params, control, consumer, options);
     todo!("runtime: start")
 }
