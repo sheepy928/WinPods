@@ -82,6 +82,7 @@ pub fn run_demo(args: &[String]) -> anyhow::Result<()> {
         engine,
         config: Config::default(),
         start_hidden: false,
+        resume_connection: false,
         instance: None,
         updater: None,
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -458,6 +459,12 @@ impl Inner {
                 let known = SPEAKERS.iter().find(|(_, ip, _)| *ip == address);
                 self.snap.device_name = known.map(|s| s.0.to_string()).unwrap_or_default();
                 self.snap.device_model = known.map(|s| s.2.to_string()).unwrap_or_default();
+                // Error only ever means "no address": a real address clears it (as in
+                // the real engine).
+                if self.snap.state == State::Error && !address.is_empty() {
+                    self.snap.state = State::Disconnected;
+                    self.snap.error.clear();
+                }
                 self.snap.device_ip = address;
                 self.restart_if_active(now);
             }
@@ -583,6 +590,14 @@ mod tests {
         let again = engine.snapshot();
         assert_eq!(again.state, State::Error);
         assert!(view::engine_gave_up(&again, ""));
+        // Setting an address ends the "no address" error.
+        engine
+            .shared
+            .apply(Command::SetDeviceIp("192.168.1.42".into()), t0);
+        let fixed = engine.snapshot();
+        assert_eq!(fixed.state, State::Disconnected);
+        assert!(fixed.error.is_empty());
+        assert_eq!(view::error_line(&fixed, false), "");
     }
 
     #[test]

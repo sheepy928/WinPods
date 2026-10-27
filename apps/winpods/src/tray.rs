@@ -46,6 +46,9 @@ pub struct TrayModel {
     pub latency_ms: u32,
     /// Version offered by "Update to vX", when an update is available.
     pub update_version: Option<String>,
+    /// The update installs in place ("Update to vX"); false: it opens the release page
+    /// (temp copy, read-only folder).
+    pub update_in_place: bool,
 }
 
 impl Default for TrayModel {
@@ -56,6 +59,7 @@ impl Default for TrayModel {
             connected: false,
             latency_ms: 100,
             update_version: None,
+            update_in_place: true,
         }
     }
 }
@@ -119,9 +123,15 @@ pub fn event_for_icon(event: &TrayIconEvent) -> Option<TrayEvent> {
     }
 }
 
-/// Text of the update menu item ("Update to v0.3.0").
-pub fn update_label(version: &str) -> String {
-    format!("Update to v{}", version.trim_start_matches(['v', 'V']))
+/// Text of the update menu item: "Update to v0.3.0", or "Open v0.3.0 release page"
+/// when the update cannot be installed in place.
+pub fn update_label(version: &str, in_place: bool) -> String {
+    let version = version.trim_start_matches(['v', 'V']);
+    if in_place {
+        format!("Update to v{version}")
+    } else {
+        format!("Open v{version} release page")
+    }
 }
 
 type Sink = Box<dyn Fn(TrayEvent) + Send + Sync + 'static>;
@@ -206,7 +216,7 @@ impl SystemTray {
             latency_menu.append(&item)?;
             latency_items.push((ms, item));
         }
-        let update_item = MenuItem::with_id(ID_UPDATE, update_label("0"), true, None);
+        let update_item = MenuItem::with_id(ID_UPDATE, update_label("0", true), true, None);
         let about_item = MenuItem::with_id(ID_ABOUT, format!("About {APP_NAME}"), true, None);
         let quit_item = MenuItem::with_id(ID_QUIT, format!("Quit {APP_NAME}"), true, None);
         menu.append_items(&[
@@ -297,7 +307,8 @@ impl SystemTray {
         }
         match (&model.update_version, self.update_shown) {
             (Some(version), shown) => {
-                self.update_item.set_text(update_label(version));
+                self.update_item
+                    .set_text(update_label(version, model.update_in_place));
                 if !shown {
                     match self.menu.insert(&self.update_item, UPDATE_POSITION) {
                         Ok(()) => self.update_shown = true,
@@ -418,8 +429,10 @@ mod tests {
 
     #[test]
     fn update_label_strips_v_prefix() {
-        assert_eq!(update_label("v0.3.0"), "Update to v0.3.0");
-        assert_eq!(update_label("0.3.0"), "Update to v0.3.0");
+        assert_eq!(update_label("v0.3.0", true), "Update to v0.3.0");
+        assert_eq!(update_label("0.3.0", true), "Update to v0.3.0");
+        // Temp copy / read-only folder: the item opens the release page.
+        assert_eq!(update_label("v0.3.0", false), "Open v0.3.0 release page");
     }
 
     #[test]
@@ -429,6 +442,7 @@ mod tests {
         assert_eq!(model.tooltip, "WinPods");
         assert!(!model.connected);
         assert_eq!(model.update_version, None);
+        assert!(model.update_in_place);
         assert_eq!(connect_label(true), "Disconnect");
         assert_eq!(connect_label(false), "Connect");
     }

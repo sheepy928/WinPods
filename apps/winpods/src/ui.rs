@@ -9,6 +9,13 @@
 //! window), close → hide to tray with a one-time hint, quit → engine shutdown on a
 //! helper thread then `slint::quit_event_loop()`.
 //!
+//! Update hand-off: after a successful swap the new exe is started first (with
+//! `--post-update <pid>`, and `--resume` when the user was connected); it waits for
+//! this process to exit before it starts its engine. Only then does this process shut
+//! down, so a failed start leaves it running and shows the error. Quit never
+//! interrupts an exe swap: it waits for one in progress and keeps a new one from
+//! starting ([`SwapGate`]); a download in progress is simply abandoned.
+//!
 //! Structure: one [`Controller`] per process lives in a thread-local on the UI thread.
 //! Slint callbacks, the UI timer and events posted from other threads ([`post`]) all
 //! reach it through [`with_controller`], so no callback holds a strong reference and
@@ -19,9 +26,9 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use slint::{
@@ -31,7 +38,7 @@ use winpods_app::Config;
 use winpods_app::single_instance::InstanceGuard;
 use winpods_app::updater::{Release, UpdateError, Updater};
 use winpods_engine::{
-    CaptureSelection, Command, DeviceInfo, EngineApi, ScanResult, ScanState, Snapshot, State,
+    CaptureSelection, Command, DeviceInfo, EngineApi, ScanResult, ScanState, Snapshot,
 };
 
 use crate::tray::{SystemTray, Tray, TrayEvent, TrayModel};
@@ -51,10 +58,14 @@ pub struct UiContext {
     pub config: Config,
     /// Start hidden in the tray (`--minimized` or config `start_minimized`).
     pub start_hidden: bool,
+    /// Connect at start even when "Connect automatically" is off: this process was
+    /// started by a self-update while the user was connected (`--resume`).
+    pub resume_connection: bool,
     /// Primary-instance guard: the UI registers the activation handler and drops the
-    /// guard before handing off to an updated executable.
+    /// guard as soon as Quit (or the update hand-off) begins.
     pub instance: Option<InstanceGuard>,
-    /// `None` disables update checks (e.g. temp copy).
+    /// `None` disables update checks (demo mode). A temp copy still checks; it is only
+    /// offered the release page, never an in-place install.
     pub updater: Option<Arc<Updater>>,
     /// Version string shown in About ("0.2.0").
     pub version: String,
@@ -121,9 +132,10 @@ pub fn run_with(ctx: UiContext, options: RunOptions) -> anyhow::Result<()> {
     }
 
     let start_hidden = ctx.start_hidden;
+    let resume = ctx.resume_connection;
     let controller = Controller::new(window, ctx, options);
     CONTROLLER.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&controller)));
-    controller.start(start_hidden);
+    controller.start(start_hidden, resume);
     drop(controller);
 
     let result = slint::run_event_loop_until_quit();
@@ -149,8 +161,12 @@ const TRAY_MAINTAIN_EVERY: Duration = Duration::from_secs(1);
 const DEFAULT_VOLUME: f32 = 40.0;
 /// Project page.
 const PROJECT_URL: &str = "https://github.com/sheepy928/WinPods";
-/// Bundled third-party notices (replaced by cargo-about output in release builds).
+/// Third-party notices shown under About: `assets/THIRD-PARTY-NOTICES.txt`, embedded
+/// at compile time exactly as that file is in the source tree (nothing here generates
+/// or replaces it).
 const THIRD_PARTY_NOTICES: &str = include_str!("../assets/THIRD-PARTY-NOTICES.txt");
+/// Hand-off argument: the updated process connects at start (the user was connected).
+pub(crate) const RESUME_ARG: &str = "--resume";
 
 thread_local! {
     static CONTROLLER: RefCell<Option<Rc<Controller>>> = const { RefCell::new(None) };
@@ -170,16 +186,17 @@ enum UiEvent {
     Activate,
     UpdateChecked {
         result: Result<Option<Release>, String>,
+        /// "Check now" (ignores a skipped version) rather than the schedule.
+        manual: bool,
     },
     UpdateProgress {
         done: u64,
         total: u64,
     },
-    /// `Err((message, offer_release_page))`.
-    UpdateInstalled(Result<Release, (String, bool)>),
-    ShutdownFinished {
-        relaunch: bool,
-    },
+    /// The download is verified; the exe swap starts.
+    UpdateSwapping,
+    UpdateInstalled(Result<Release, (String, InstallFailure)>),
+    ShutdownFinished,
 }
 
 /// Hand an event to the UI thread (callable from any thread).
@@ -191,8 +208,67 @@ fn post(event: UiEvent) {
 
 /// Requests to the update-check thread.
 enum UpdateRequest {
+    /// "Check now": runs even with automatic updates off and ignores (and, when it
+    /// finds a release, forgets) a skipped version.
     CheckNow,
+    /// Run the automatic check now (automatic updates were just switched on).
+    CheckAutomatic,
     Skip(Option<String>),
+}
+
+/// Why an install attempt failed; decides what the banner offers next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallFailure {
+    /// The signature did not verify when the release was downloaded: it is not
+    /// offered again in any form (no "Open release page").
+    Refused,
+    /// The exe folder cannot be written: this release is offered as its release page.
+    NotWritable,
+    /// Anything else (network, checksum, swap): "Install" stays available to retry.
+    Retryable,
+}
+
+impl InstallFailure {
+    fn of(err: &UpdateError) -> InstallFailure {
+        match err {
+            UpdateError::Signature(_) => InstallFailure::Refused,
+            UpdateError::NotWritable(_) => InstallFailure::NotWritable,
+            _ => InstallFailure::Retryable,
+        }
+    }
+}
+
+/// Keeps Quit from cutting an exe swap in half. The install thread runs the swap
+/// through [`SwapGate::run`]; Quit calls [`SwapGate::close`] (never blocks) and, off the
+/// UI thread, [`SwapGate::wait_idle`] before the process exits. A swap that started
+/// before `close` finishes (or rolls back) first; none starts after it. Downloads are
+/// not covered: they are abandoned at exit and leave only a harmless `.new` file.
+#[derive(Default)]
+struct SwapGate {
+    closed: AtomicBool,
+    running: Mutex<()>,
+}
+
+impl SwapGate {
+    /// Run `swap` while holding the gate, or return `None` without running it once
+    /// Quit has closed the gate.
+    fn run<R>(&self, swap: impl FnOnce() -> R) -> Option<R> {
+        let _running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.closed.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(swap())
+    }
+
+    /// No swap may start from now on.
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    /// Block until a swap in progress (if any) has finished.
+    fn wait_idle(&self) {
+        drop(self.running.lock().unwrap_or_else(PoisonError::into_inner));
+    }
 }
 
 /// What the update machinery is doing. Checking and installing are tracked apart so
@@ -210,16 +286,37 @@ enum UpdatePhase {
 /// Update banner state.
 #[derive(Default)]
 struct UpdateUi {
+    /// A newer release whose signed checksums verified (from [`Updater::check`]).
     available: Option<Release>,
     phase: UpdatePhase,
     status: String,
+    /// Why the last install attempt failed. Shown in both banners until the next
+    /// successful check, a new install attempt, Skip or Dismiss.
+    error: Option<String>,
+    /// Installing in place is possible at all (writable folder, not a temp copy).
     can_install: bool,
+    /// Tag of the release whose install found the folder read-only: that release is
+    /// offered as its release page (later releases are tried in place again).
+    page_only: Option<String>,
+    /// The exe was swapped but the new version could not be started: nothing is
+    /// offered again until WinPods restarts (a second swap would fail).
+    restart_pending: Option<semver::Version>,
 }
 
 impl UpdateUi {
     /// Buttons that start update work are disabled while this is true.
     fn busy(&self) -> bool {
         self.phase != UpdatePhase::Idle
+    }
+
+    /// "Install & restart" (true) or "Open release page" (false) for the available
+    /// release.
+    fn offers_install(&self) -> bool {
+        self.can_install
+            && self
+                .available
+                .as_ref()
+                .is_some_and(|r| self.page_only.as_deref() != Some(r.tag.as_str()))
     }
 
     /// Start a manual check; false while a check or an install is already running.
@@ -240,6 +337,10 @@ impl UpdateUi {
             return false;
         }
         self.phase = UpdatePhase::Idle;
+        if let Some(version) = &self.restart_pending {
+            self.status = format!("WinPods {version} is installed; restart WinPods to use it");
+            return true;
+        }
         match result {
             Ok(release) => {
                 self.status = match &release {
@@ -250,6 +351,7 @@ impl UpdateUi {
                     ),
                 };
                 self.available = release;
+                self.error = None;
             }
             Err(err) => self.status = format!("Could not check for updates: {err}"),
         }
@@ -265,16 +367,40 @@ impl UpdateUi {
         let release = self.available.clone()?;
         self.phase = UpdatePhase::Installing;
         self.status = "Downloading…".to_string();
+        self.error = None;
         Some(release)
     }
 
-    /// The install failed: back to idle with the error shown.
-    fn install_failed(&mut self, message: &str, offer_release_page: bool) {
+    /// The install failed: back to idle with the error shown in both banners.
+    fn install_failed(&mut self, message: &str, failure: InstallFailure) {
         self.phase = UpdatePhase::Idle;
-        self.status = format!("Update failed: {message}");
-        if offer_release_page {
-            self.can_install = false;
-        }
+        let text = match failure {
+            InstallFailure::Refused => {
+                self.available = None;
+                format!("Update refused: the release signature did not verify ({message})")
+            }
+            InstallFailure::NotWritable => {
+                self.page_only = self.available.as_ref().map(|r| r.tag.clone());
+                format!("Update failed: {message}")
+            }
+            InstallFailure::Retryable => format!("Update failed: {message}"),
+        };
+        self.status = text.clone();
+        self.error = Some(text);
+    }
+
+    /// The new exe is in place but could not be started; this process keeps running.
+    fn restart_failed(&mut self, release: &Release, message: &str) {
+        self.phase = UpdatePhase::Idle;
+        self.available = None;
+        self.restart_pending = Some(release.version.clone());
+        let text = format!(
+            "WinPods {} is installed, but it could not be started ({message}). Quit \
+             WinPods and start it again to finish.",
+            release.version
+        );
+        self.status = text.clone();
+        self.error = Some(text);
     }
 }
 
@@ -284,6 +410,9 @@ struct UiState {
     shown: bool,
     /// The user's intent: keep a connection up (drives the Connect switch).
     wants: bool,
+    /// Connect was pressed before a speaker address was set: show how to set one
+    /// (cleared once an address is set or the connection is switched off).
+    no_address_hint: bool,
     quitting: bool,
     last_snapshot: Option<Arc<Snapshot>>,
     devices: Option<Arc<Vec<DeviceInfo>>>,
@@ -310,6 +439,7 @@ struct Controller {
     instance: RefCell<Option<InstanceGuard>>,
     update_tx: RefCell<Option<mpsc::Sender<UpdateRequest>>>,
     auto_update: Arc<AtomicBool>,
+    swap_gate: Arc<SwapGate>,
     tick_timer: Timer,
     latency_timer: Timer,
     volume_timer: Timer,
@@ -407,6 +537,7 @@ impl Controller {
         if config.device_ip.trim().is_empty() && !snapshot.device_ip.trim().is_empty() {
             config.device_ip = snapshot.device_ip.trim().to_string();
         }
+        // False for a temp copy or a read-only folder: only the release page is offered.
         let can_install = !ctx.demo && ctx.updater.is_some() && Updater::can_install_in_place();
         let auto_update = Arc::new(AtomicBool::new(config.auto_update));
         let mut update = UpdateUi {
@@ -435,6 +566,7 @@ impl Controller {
                 config,
                 shown: false,
                 wants: false,
+                no_address_hint: false,
                 quitting: false,
                 last_snapshot: None,
                 devices: None,
@@ -453,6 +585,7 @@ impl Controller {
             instance: RefCell::new(ctx.instance),
             update_tx: RefCell::new(None),
             auto_update,
+            swap_gate: Arc::default(),
             tick_timer: Timer::default(),
             latency_timer: Timer::default(),
             volume_timer: Timer::default(),
@@ -504,19 +637,24 @@ impl Controller {
         self.update_latency_hint();
     }
 
-    fn start(&self, start_hidden: bool) {
+    fn start(&self, start_hidden: bool, resume: bool) {
         // Engine-facing start-up: devices, first snapshot, auto-connect.
         let snapshot = self.engine.snapshot();
         if snapshot.devices.is_empty() {
             self.engine.send(Command::RefreshDevices);
         }
         self.apply_snapshot(&snapshot);
-        let auto_connect = {
+        // After a self-update the stream resumes when the user was connected, whatever
+        // "Connect automatically" says.
+        let connect = {
             let s = self.state.borrow();
-            s.config.auto_connect
+            (s.config.auto_connect || resume)
                 && !view::effective_address(&snapshot, &s.config.device_ip).is_empty()
         };
-        if auto_connect {
+        if resume {
+            tracing::info!(connect, "resuming the connection after the update");
+        }
+        if connect {
             self.set_wants(true);
             self.engine.send(Command::Connect);
         }
@@ -561,8 +699,14 @@ impl Controller {
 
     fn bind_callbacks(&self) {
         let app = self.app();
-        app.on_connect_toggled(|on| with_controller(|c| c.set_connection(on)));
+        app.on_connect_toggled(|on| {
+            with_controller(|c| {
+                c.set_connection(on);
+            })
+        });
         app.on_source_selected(|index| with_controller(|c| c.select_source(index)));
+        app.on_refresh_sources(|| with_controller(|c| c.engine.send(Command::RefreshDevices)));
+        app.on_dismiss_update_error(|| with_controller(|c| c.dismiss_update_error()));
         app.on_latency_preset(|index| {
             with_controller(|c| {
                 if let Some(&ms) = usize::try_from(index)
@@ -630,14 +774,18 @@ impl Controller {
         match event {
             UiEvent::Tray(event) => self.handle_tray(event),
             UiEvent::Activate => self.show_window(),
-            UiEvent::UpdateChecked { result } => self.update_checked(result),
+            UiEvent::UpdateChecked { result, manual } => self.update_checked(result, manual),
             UiEvent::UpdateProgress { done, total } => {
                 let percent = done.saturating_mul(100).checked_div(total).unwrap_or(0);
                 self.state.borrow_mut().update.status = format!("Downloading… {percent}%");
                 self.push_update_ui();
             }
+            UiEvent::UpdateSwapping => {
+                self.state.borrow_mut().update.status = "Installing…".to_string();
+                self.push_update_ui();
+            }
             UiEvent::UpdateInstalled(result) => self.update_installed(result),
-            UiEvent::ShutdownFinished { relaunch } => self.finish_quit(relaunch),
+            UiEvent::ShutdownFinished => self.finish_quit(),
         }
     }
 
@@ -666,14 +814,19 @@ impl Controller {
             TrayEvent::ShowWindow => self.show_window(),
             TrayEvent::ToggleConnection => {
                 let wants = self.state.borrow().wants;
-                self.set_connection(!wants);
+                if !self.set_connection(!wants) {
+                    // No speaker address yet: show where the hint and the setting are.
+                    self.show_window();
+                }
             }
             TrayEvent::SetLatency(ms) => {
                 self.latency_timer.stop();
                 self.set_latency(ms);
             }
             TrayEvent::InstallUpdate => {
+                // The main page's banner shows the progress and any failure.
                 self.show_window();
+                self.app().set_page(0);
                 self.install_update();
             }
             TrayEvent::ShowAbout => {
@@ -707,7 +860,11 @@ impl Controller {
             tracing::warn!("could not show the window: {err}");
             return;
         }
-        self.state.borrow_mut().shown = true;
+        let was_shown = std::mem::replace(&mut self.state.borrow_mut().shown, true);
+        if !was_shown {
+            // Devices may have been plugged in or removed while the window was hidden.
+            self.engine.send(Command::RefreshDevices);
+        }
         if self.window.window().is_minimized() {
             self.window.window().set_minimized(false);
         }
@@ -779,10 +936,11 @@ impl Controller {
 
     /// Hide everything at once, stop the engine on a helper thread, then quit.
     fn quit(&self) {
-        self.begin_shutdown(false);
+        self.begin_shutdown();
     }
 
-    fn begin_shutdown(&self, relaunch: bool) {
+    /// Quit (also the second half of the update hand-off, once the new exe started).
+    fn begin_shutdown(&self) {
         {
             let mut s = self.state.borrow_mut();
             if s.quitting {
@@ -790,6 +948,12 @@ impl Controller {
             }
             s.quitting = true;
         }
+        // No exe swap may start from here on; one in progress is waited for below.
+        self.swap_gate.close();
+        // Release the single-instance mutex now: WinPods started again while this
+        // process is still stopping the engine becomes the new instance, instead of
+        // "activating" this one, which would ignore it.
+        self.instance.borrow_mut().take();
         self.tick_timer.stop();
         self.latency_timer.stop();
         self.volume_timer.stop();
@@ -798,40 +962,26 @@ impl Controller {
         self.update_tx.borrow_mut().take();
 
         let shutdown = self.shutdown.borrow_mut().take();
+        let gate = Arc::clone(&self.swap_gate);
         let spawned = std::thread::Builder::new()
             .name("engine-shutdown".into())
             .spawn(move || {
                 if let Some(shutdown) = shutdown {
                     shutdown();
                 }
-                post(UiEvent::ShutdownFinished { relaunch });
+                // Never exit between the two renames of an exe swap.
+                gate.wait_idle();
+                post(UiEvent::ShutdownFinished);
             });
         if let Err(err) = spawned {
             // The closure (and the hook) went down with the failed spawn.
             tracing::error!("could not start the shutdown thread: {err}");
-            self.finish_quit(relaunch);
+            self.swap_gate.wait_idle();
+            self.finish_quit();
         }
     }
 
-    fn finish_quit(&self, relaunch: bool) {
-        if relaunch {
-            // Release the single-instance mutex before the new process looks for it.
-            self.instance.borrow_mut().take();
-            match winpods_app::paths::exe_path() {
-                Ok(exe) => {
-                    let spawned = std::process::Command::new(&exe)
-                        .arg("--post-update")
-                        .arg(std::process::id().to_string())
-                        .arg("--updated-from")
-                        .arg(env!("CARGO_PKG_VERSION"))
-                        .spawn();
-                    if let Err(err) = spawned {
-                        tracing::error!("could not start {}: {err}", exe.display());
-                    }
-                }
-                Err(err) => tracing::error!("no executable path for the restart: {err}"),
-            }
-        }
+    fn finish_quit(&self) {
         if let Err(err) = slint::quit_event_loop() {
             tracing::error!("could not quit the event loop: {err}");
         }
@@ -885,23 +1035,19 @@ impl Controller {
 
     fn apply_snapshot(&self, snap: &Arc<Snapshot>) {
         let app = self.app();
-        let (title, detail, has_address, devices_changed, wants_changed) = {
+        let (title, detail, devices_changed, wants_changed) = {
             let mut s = self.state.borrow_mut();
             s.last_snapshot = Some(Arc::clone(snap));
-            let has_address = !view::effective_address(snap, &s.config.device_ip).is_empty();
             // The engine gives up (and stays in Error) when there is no address to
             // connect to; checked on every snapshot, not only on state transitions.
             let wants_changed = s.wants && view::engine_gave_up(snap, &s.config.device_ip);
             if wants_changed {
                 s.wants = false;
             }
-            let devices_changed = s
-                .devices
-                .as_ref()
-                .is_none_or(|known| !Arc::ptr_eq(known, &snap.devices));
-            if devices_changed {
-                s.devices = Some(Arc::clone(&snap.devices));
-            }
+            // Compared by value: every refresh (window shown, Source opened) publishes
+            // a new list, and rebuilding the combo box needlessly would disturb it.
+            let devices_changed = view::devices_changed(s.devices.as_ref(), &snap.devices);
+            s.devices = Some(Arc::clone(&snap.devices));
             // Only a name discovered for the configured address is saved.
             let discovered =
                 view::name_to_persist(snap, &s.config.device_ip, &s.config.device_name)
@@ -916,18 +1062,12 @@ impl Controller {
             if save {
                 self.save_config();
             }
-            (title, detail, has_address, devices_changed, wants_changed)
+            (title, detail, devices_changed, wants_changed)
         };
 
         app.set_speaker_name(shared(title));
         app.set_speaker_detail(shared(detail));
-        app.set_status_text(shared(view::status_text(snap, has_address)));
-        app.set_status_kind(ui_status_kind(view::StatusKind::from(snap.state)));
-        let error = match snap.state {
-            State::Error | State::Reconnecting => snap.error.trim(),
-            _ => "",
-        };
-        app.set_error_text(shared(error));
+        self.refresh_status();
         app.set_capture_detail(shared(view::capture_detail(snap)));
         app.set_stats_text(shared(view::stats_line(snap)));
         if wants_changed {
@@ -945,10 +1085,11 @@ impl Controller {
 
     fn tray_model(&self) -> TrayModel {
         let s = self.state.borrow();
-        let snapshot = s
+        let raw = s
             .last_snapshot
             .clone()
             .unwrap_or_else(|| self.engine.snapshot());
+        let snapshot = view::presented(&raw, &s.config.device_ip, s.wants);
         let speaker = view::speaker_title(&snapshot, &s.config.device_name, &s.config.device_ip);
         TrayModel {
             state: snapshot.state,
@@ -956,6 +1097,7 @@ impl Controller {
             connected: s.wants,
             latency_ms: s.config.latency_clamped(),
             update_version: s.update.available.as_ref().map(|r| r.version.to_string()),
+            update_in_place: s.update.offers_install(),
         }
     }
 
@@ -973,9 +1115,11 @@ impl Controller {
         self.app().set_connect_on(wants);
     }
 
-    fn set_connection(&self, on: bool) {
-        // Without an address the engine refuses (and reports why in the snapshot), so
-        // the switch springs back instead of staying on while nothing connects.
+    /// Switch the connection on or off. Returns false when "on" is impossible because
+    /// no speaker address is set: the switch springs back and the card shows how to
+    /// set one. The engine is not asked to connect then (it would only enter an error
+    /// state that outlives the address being set).
+    fn set_connection(&self, on: bool) -> bool {
         let possible = on && {
             let s = self.state.borrow();
             let snapshot = s
@@ -985,12 +1129,39 @@ impl Controller {
             !view::effective_address(&snapshot, &s.config.device_ip).is_empty()
         };
         self.set_wants(possible);
-        self.engine.send(if on {
-            Command::Connect
-        } else {
-            Command::Disconnect
-        });
+        self.state.borrow_mut().no_address_hint = on && !possible;
+        if possible {
+            self.engine.send(Command::Connect);
+        } else if !on {
+            self.engine.send(Command::Disconnect);
+        }
+        self.refresh_status();
         self.refresh_tray();
+        possible || !on
+    }
+
+    /// Status pill and the line under the speaker card (engine error or the address
+    /// hint), from the last snapshot as presented (a stale "no address" error is shown
+    /// as Disconnected once an address is set).
+    fn refresh_status(&self) {
+        let (text, kind, error) = {
+            let s = self.state.borrow();
+            let raw = s
+                .last_snapshot
+                .clone()
+                .unwrap_or_else(|| self.engine.snapshot());
+            let snap = view::presented(&raw, &s.config.device_ip, s.wants);
+            let has_address = !view::effective_address(&snap, &s.config.device_ip).is_empty();
+            (
+                view::status_text(&snap, has_address),
+                view::StatusKind::from(snap.state),
+                view::error_line(&snap, s.no_address_hint),
+            )
+        };
+        let app = self.app();
+        app.set_status_text(shared(text));
+        app.set_status_kind(ui_status_kind(kind));
+        app.set_error_text(shared(error));
     }
 
     // ------------------------------------------------------------------ source
@@ -1163,6 +1334,10 @@ impl Controller {
             let name_changed = s.config.device_name != new_name;
             s.config.device_ip = address.clone();
             s.config.device_name = new_name;
+            if !address.is_empty() {
+                // The first-run "no speaker address" hint no longer applies.
+                s.no_address_hint = false;
+            }
             (address_changed, name_changed)
         };
         if address_changed || name_changed {
@@ -1171,6 +1346,7 @@ impl Controller {
         if address_changed {
             self.engine.send(Command::SetDeviceIp(address));
         }
+        self.refresh_status();
         self.refresh_tray();
     }
 
@@ -1352,25 +1528,31 @@ impl Controller {
         ));
         app.set_update_status(shared(&update.status));
         app.set_update_busy(update.busy());
-        app.set_update_can_install(update.can_install);
+        app.set_update_can_install(update.offers_install());
+        app.set_update_error(shared(update.error.as_deref().unwrap_or_default()));
     }
 
     fn start_update_checks(&self) {
         let Some(updater) = self.updater.clone() else {
             return;
         };
-        let (skipped, first_delay) = {
-            let s = self.state.borrow();
-            (
-                s.config.skipped_version.clone(),
-                view::update_first_delay(unix_now(), s.config.last_update_check),
-            )
-        };
+        let skipped = self.state.borrow().config.skipped_version.clone();
         let (tx, rx) = mpsc::channel();
         let auto = Arc::clone(&self.auto_update);
+        // Plan: check at start (shortly, to keep start-up quiet), then every 24 h, so
+        // an update found earlier is offered again after a restart.
         let spawned = std::thread::Builder::new()
             .name("update-check".into())
-            .spawn(move || update_check_loop(&updater, &auto, skipped, first_delay, &rx));
+            .spawn(move || {
+                update_check_loop(
+                    &|skipped| updater.check(skipped),
+                    &auto,
+                    skipped,
+                    LoopTiming::PRODUCTION,
+                    &rx,
+                    &|result, manual| post(UiEvent::UpdateChecked { result, manual }),
+                );
+            });
         match spawned {
             Ok(_) => *self.update_tx.borrow_mut() = Some(tx),
             Err(err) => tracing::warn!("could not start update checks: {err}"),
@@ -1380,11 +1562,12 @@ impl Controller {
     fn set_auto_update(&self, on: bool) {
         self.auto_update.store(on, Ordering::Relaxed);
         self.edit_config(|config| config.auto_update = on);
-        let due =
-            view::update_first_delay(unix_now(), self.state.borrow().config.last_update_check)
-                <= view::UPDATE_STARTUP_DELAY;
+        let due = view::update_check_due(unix_now(), self.state.borrow().config.last_update_check);
         if on && due {
-            self.check_updates();
+            // An automatic check: it honours a skipped version (unlike "Check now").
+            if let Some(tx) = self.update_tx.borrow().as_ref() {
+                let _ = tx.send(UpdateRequest::CheckAutomatic);
+            }
         }
     }
 
@@ -1396,7 +1579,7 @@ impl Controller {
         if self.demo {
             Timer::single_shot(Duration::from_millis(1200), || {
                 with_controller(|c| {
-                    c.update_checked(Ok(Some(demo_release())));
+                    c.update_checked(Ok(Some(demo_release())), true);
                 })
             });
             return;
@@ -1407,19 +1590,26 @@ impl Controller {
             .as_ref()
             .is_some_and(|tx| tx.send(UpdateRequest::CheckNow).is_ok());
         if !sent {
-            self.update_checked(Err("update checks are not available".to_string()));
+            self.update_checked(Err("update checks are not available".to_string()), true);
         }
     }
 
     /// Result of a manual or automatic check (automatic ones arrive at any time, also
     /// while an install is running; the banner then keeps showing the install).
-    fn update_checked(&self, result: Result<Option<Release>, String>) {
+    fn update_checked(&self, result: Result<Option<Release>, String>, manual: bool) {
         let now = unix_now();
         let save = {
             let mut s = self.state.borrow_mut();
-            let save = result.is_ok() && !self.demo;
-            if save {
+            let mut save = false;
+            if result.is_ok() {
                 s.config.last_update_check = Some(now);
+                save = true;
+            }
+            // "Check now" ignores a skipped version; when it finds a release the skip
+            // is forgotten, so the release stays offered (this is how a skip is undone).
+            if manual && matches!(result, Ok(Some(_))) && s.config.skipped_version.take().is_some()
+            {
+                save = true;
             }
             if !s.update.finish_check(result, now) {
                 tracing::debug!("update check finished during an install; banner unchanged");
@@ -1434,11 +1624,11 @@ impl Controller {
     }
 
     fn install_update(&self) {
-        let (release, can_install, busy) = {
+        let (release, offers_install, busy) = {
             let s = self.state.borrow();
             (
                 s.update.available.clone(),
-                s.update.can_install,
+                s.update.offers_install(),
                 s.update.busy(),
             )
         };
@@ -1454,7 +1644,9 @@ impl Controller {
             self.push_update_ui();
             return;
         }
-        if !can_install {
+        if !offers_install {
+            // Temp copy or read-only folder. The release's signature verified when it
+            // was found; the page URL is built from the repository and the tag.
             shell_open(&release.html_url);
             return;
         }
@@ -1467,6 +1659,7 @@ impl Controller {
             return;
         };
         self.push_update_ui();
+        let gate = Arc::clone(&self.swap_gate);
         let spawned = std::thread::Builder::new()
             .name("update-install".into())
             .spawn(move || {
@@ -1480,35 +1673,59 @@ impl Controller {
                         post(UiEvent::UpdateProgress { done, total });
                     }
                 };
-                let result = updater
-                    .stage(&release, &progress)
-                    .and_then(|staged| updater.install(&staged).map(|()| staged.release));
-                post(UiEvent::UpdateInstalled(result.map_err(|err| {
-                    let fallback =
-                        matches!(err, UpdateError::Signature(_) | UpdateError::NotWritable(_));
-                    (err.to_string(), fallback)
-                })));
+                if let Some(result) = install_worker(&updater, &release, &gate, &progress) {
+                    post(UiEvent::UpdateInstalled(result));
+                }
             });
         if let Err(err) = spawned {
-            self.update_installed(Err((format!("could not start the download: {err}"), false)));
+            self.update_installed(Err((
+                format!("could not start the download: {err}"),
+                InstallFailure::Retryable,
+            )));
         }
     }
 
-    fn update_installed(&self, result: Result<Release, (String, bool)>) {
+    fn update_installed(&self, result: Result<Release, (String, InstallFailure)>) {
+        if self.state.borrow().quitting {
+            // Quit came first: never start the new version behind the user's back. A
+            // swapped exe simply runs next time.
+            if let Ok(release) = &result {
+                tracing::info!("update {} installed while quitting", release.tag);
+            }
+            return;
+        }
         match result {
             Ok(release) => {
-                self.state.borrow_mut().update.status =
-                    format!("Restarting into WinPods {}…", release.version);
-                self.push_update_ui();
-                // Stop the engine, hide the tray, release the mutex, start the new exe.
-                self.begin_shutdown(true);
+                let resume = self.state.borrow().wants;
+                match spawn_updated_exe(resume) {
+                    Ok(()) => {
+                        tracing::info!(resume, "update {}: handing off", release.tag);
+                        self.state.borrow_mut().update.status =
+                            format!("Restarting into WinPods {}…", release.version);
+                        self.push_update_ui();
+                        // The new process waits for this one to exit before starting
+                        // its engine: stop ours, hide the tray, release the mutex, quit.
+                        self.begin_shutdown();
+                    }
+                    Err(err) => {
+                        // Keep running (the engine is untouched) and say what happened.
+                        tracing::error!("update {}: {err}", release.tag);
+                        self.state
+                            .borrow_mut()
+                            .update
+                            .restart_failed(&release, &err);
+                        self.push_update_ui();
+                        self.refresh_tray();
+                    }
+                }
             }
-            Err((message, offer_release_page)) => {
+            Err((message, failure)) => {
                 self.state
                     .borrow_mut()
                     .update
-                    .install_failed(&message, offer_release_page);
+                    .install_failed(&message, failure);
                 self.push_update_ui();
+                self.refresh_tray();
             }
         }
     }
@@ -1523,7 +1740,8 @@ impl Controller {
                 return;
             };
             s.config.skipped_version = Some(release.tag.clone());
-            s.update.status = format!("Skipped {}", release.tag);
+            s.update.status = format!("Skipped {} · Check now offers it again", release.tag);
+            s.update.error = None;
             release.tag
         };
         self.save_config();
@@ -1533,40 +1751,132 @@ impl Controller {
         self.push_update_ui();
         self.refresh_tray();
     }
+
+    fn dismiss_update_error(&self) {
+        self.state.borrow_mut().update.error = None;
+        self.push_update_ui();
+    }
 }
 
-/// Background update schedule: first check after `first_delay`, then every 24 h,
-/// backing off 1/5/30 min after failures. "Check now" requests run regardless of the
-/// automatic-updates switch. Ends when the UI drops the sender.
-fn update_check_loop(
+/// Arguments that start the updated exe: `--post-update <pid> --updated-from
+/// <version>`, plus [`RESUME_ARG`] when the user was connected (the new process then
+/// connects regardless of "Connect automatically").
+pub(crate) fn handoff_args(pid: u32, from_version: &str, resume: bool) -> Vec<String> {
+    let mut args = vec![
+        "--post-update".to_string(),
+        pid.to_string(),
+        "--updated-from".to_string(),
+        from_version.to_string(),
+    ];
+    if resume {
+        args.push(RESUME_ARG.to_string());
+    }
+    args
+}
+
+/// Start the freshly swapped-in exe (it waits for this process to exit).
+fn spawn_updated_exe(resume: bool) -> Result<(), String> {
+    let exe = winpods_app::paths::exe_path()
+        .map_err(|err| format!("no executable path for the restart: {err}"))?;
+    std::process::Command::new(&exe)
+        .args(handoff_args(
+            std::process::id(),
+            env!("CARGO_PKG_VERSION"),
+            resume,
+        ))
+        .spawn()
+        .map(drop)
+        .map_err(|err| format!("could not start {}: {err}", exe.display()))
+}
+
+/// The install thread: download and verify `release`, then swap it in unless Quit has
+/// begun. `None` when Quit came first (nothing was swapped; the staged files are
+/// removed).
+fn install_worker(
     updater: &Updater,
+    release: &Release,
+    gate: &SwapGate,
+    progress: &dyn Fn(u64, u64),
+) -> Option<Result<Release, (String, InstallFailure)>> {
+    let failed = |err: UpdateError| {
+        tracing::warn!("update {} failed: {err}", release.tag);
+        (err.to_string(), InstallFailure::of(&err))
+    };
+    let staged = match updater.stage(release, progress) {
+        Ok(staged) => staged,
+        Err(err) => return Some(Err(failed(err))),
+    };
+    post(UiEvent::UpdateSwapping);
+    match gate.run(|| updater.install(&staged)) {
+        Some(Ok(())) => Some(Ok(staged.release)),
+        Some(Err(err)) => Some(Err(failed(err))),
+        None => {
+            for (file, _) in &staged.files {
+                let _ = std::fs::remove_file(file);
+            }
+            tracing::info!("update {}: not installed, WinPods is quitting", release.tag);
+            None
+        }
+    }
+}
+
+/// One update check (`skipped` → newest offered release), as [`Updater::check`].
+type CheckFn<'a> = dyn Fn(Option<&str>) -> Result<Option<Release>, UpdateError> + 'a;
+
+/// Timing of [`update_check_loop`] (shortened in tests).
+#[derive(Debug, Clone, Copy)]
+struct LoopTiming {
+    /// Delay of the first check after start-up.
+    first: Duration,
+    /// Time between automatic checks.
+    period: Duration,
+}
+
+impl LoopTiming {
+    const PRODUCTION: LoopTiming = LoopTiming {
+        first: view::UPDATE_STARTUP_DELAY,
+        period: view::UPDATE_PERIOD,
+    };
+}
+
+/// Background update schedule: first check `timing.first` after start, then every
+/// `timing.period`, backing off 1/5/30 min after failures. Automatic checks honour
+/// `skipped` and the automatic-updates switch; "Check now" runs regardless and ignores
+/// the skip (and forgets it when it finds a release). Every result goes to `report`
+/// with whether it was manual. Ends when the UI drops the sender.
+fn update_check_loop(
+    check: &CheckFn<'_>,
     auto: &AtomicBool,
     mut skipped: Option<String>,
-    first_delay: Duration,
+    timing: LoopTiming,
     requests: &mpsc::Receiver<UpdateRequest>,
+    report: &dyn Fn(Result<Option<Release>, String>, bool),
 ) {
-    let mut next = Instant::now() + first_delay;
+    let mut next = Instant::now() + timing.first;
     let mut failures = 0usize;
     loop {
         let manual = match requests.recv_timeout(next.saturating_duration_since(Instant::now())) {
             Ok(UpdateRequest::CheckNow) => true,
+            Ok(UpdateRequest::CheckAutomatic) | Err(RecvTimeoutError::Timeout) => false,
             Ok(UpdateRequest::Skip(version)) => {
                 skipped = version;
                 continue;
             }
-            Err(RecvTimeoutError::Timeout) => false,
             Err(RecvTimeoutError::Disconnected) => return,
         };
         if !manual && !auto.load(Ordering::Relaxed) {
-            next = Instant::now() + view::UPDATE_PERIOD;
+            next = Instant::now() + timing.period;
             continue;
         }
-        let result = updater.check(skipped.as_deref());
+        let result = check(if manual { None } else { skipped.as_deref() });
+        if manual && matches!(result, Ok(Some(_))) {
+            skipped = None;
+        }
         next = Instant::now()
             + match &result {
                 Ok(_) => {
                     failures = 0;
-                    view::UPDATE_PERIOD
+                    timing.period
                 }
                 Err(err) => {
                     tracing::info!("update check failed: {err}");
@@ -1575,9 +1885,7 @@ fn update_check_loop(
                     delay
                 }
             };
-        post(UiEvent::UpdateChecked {
-            result: result.map_err(|err| err.to_string()),
-        });
+        report(result.map_err(|err| err.to_string()), manual);
     }
 }
 
@@ -1658,11 +1966,301 @@ mod tests {
         assert!(update.begin_install().is_none());
         assert!(!update.begin_check());
 
-        update.install_failed("signature mismatch", true);
+        update.install_failed("connection reset", InstallFailure::Retryable);
         assert!(!update.busy());
-        assert!(!update.can_install);
-        assert_eq!(update.status, "Update failed: signature mismatch");
+        assert_eq!(update.status, "Update failed: connection reset");
         assert!(update.begin_install().is_some());
+    }
+
+    fn release(tag: &str) -> Release {
+        Release {
+            tag: tag.to_string(),
+            version: winpods_app::updater::parse_tag(tag).unwrap(),
+            html_url: format!("https://github.com/sheepy928/WinPods/releases/tag/{tag}"),
+            notes: String::new(),
+            assets: Vec::new(),
+        }
+    }
+
+    fn offering(tag: &str) -> UpdateUi {
+        let mut update = UpdateUi {
+            can_install: true,
+            ..UpdateUi::default()
+        };
+        assert!(update.finish_check(Ok(Some(release(tag))), 1_000));
+        update
+    }
+
+    #[test]
+    fn read_only_or_temp_installs_only_offer_the_release_page() {
+        let mut update = offering("v0.3.0");
+        assert!(update.offers_install());
+        update.can_install = false; // temp copy / read-only folder
+        assert!(!update.offers_install());
+        assert!(!UpdateUi::default().offers_install(), "nothing available");
+    }
+
+    #[test]
+    fn a_failed_install_is_shown_until_the_next_check() {
+        let mut update = offering("v0.3.0");
+        update.begin_install().unwrap();
+        update.install_failed("SHA-256 does not match", InstallFailure::Retryable);
+        // Visible (both banners show `error`), and Install stays available to retry.
+        assert_eq!(
+            update.error.as_deref(),
+            Some("Update failed: SHA-256 does not match")
+        );
+        assert!(update.offers_install());
+        // A new attempt clears it...
+        update.begin_install().unwrap();
+        assert_eq!(update.error, None);
+        update.install_failed("offline", InstallFailure::Retryable);
+        // ...so does a successful check, but not a failed one.
+        assert!(update.finish_check(Err("offline".into()), 2_000));
+        assert!(update.error.is_some());
+        assert!(update.finish_check(Ok(Some(release("v0.3.0"))), 2_000));
+        assert_eq!(update.error, None);
+    }
+
+    #[test]
+    fn a_signature_failure_hides_the_release_but_not_later_ones() {
+        let mut update = offering("v0.3.0");
+        update.begin_install().unwrap();
+        update.install_failed("SHA256SUMS.txt does not verify", InstallFailure::Refused);
+        // No "Open release page" for a release whose signature failed.
+        assert_eq!(update.available, None);
+        assert!(!update.offers_install());
+        assert!(
+            update
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("Update refused"))
+        );
+        // A later (verified) release installs in place again.
+        assert!(update.finish_check(Ok(Some(release("v0.3.1"))), 3_000));
+        assert!(update.offers_install());
+        assert_eq!(update.error, None);
+    }
+
+    #[test]
+    fn a_read_only_folder_turns_only_that_release_into_a_page() {
+        let mut update = offering("v0.3.0");
+        update.begin_install().unwrap();
+        update.install_failed(
+            "C:\\Program Files\\WinPods is not writable",
+            InstallFailure::NotWritable,
+        );
+        assert!(update.available.is_some());
+        assert!(!update.offers_install(), "same release: release page");
+        assert!(update.finish_check(Ok(Some(release("v0.4.0"))), 3_000));
+        assert!(
+            update.offers_install(),
+            "a new release is tried in place again"
+        );
+    }
+
+    #[test]
+    fn a_failed_restart_keeps_running_and_offers_nothing_more() {
+        let mut update = offering("v0.3.0");
+        let installing = update.begin_install().unwrap();
+        update.restart_failed(&installing, "access denied");
+        assert!(!update.busy());
+        assert_eq!(update.available, None);
+        let error = update.error.clone().unwrap();
+        assert!(
+            error.contains("0.3.0") && error.contains("access denied"),
+            "{error}"
+        );
+        // The exe is already swapped: a later check must not offer it again.
+        assert!(update.finish_check(Ok(Some(release("v0.3.0"))), 4_000));
+        assert_eq!(update.available, None);
+        assert!(update.status.contains("restart WinPods"));
+    }
+
+    #[test]
+    fn install_failures_follow_the_error_kind() {
+        assert_eq!(
+            InstallFailure::of(&UpdateError::Signature("x".into())),
+            InstallFailure::Refused
+        );
+        assert_eq!(
+            InstallFailure::of(&UpdateError::NotWritable("x".into())),
+            InstallFailure::NotWritable
+        );
+        for err in [
+            UpdateError::Network("x".into()),
+            UpdateError::Integrity("x".into()),
+            UpdateError::Swap("x".into()),
+            UpdateError::Other("x".into()),
+        ] {
+            assert_eq!(InstallFailure::of(&err), InstallFailure::Retryable);
+        }
+    }
+
+    #[test]
+    fn swap_gate_refuses_to_start_a_swap_after_quit() {
+        let gate = SwapGate::default();
+        assert_eq!(gate.run(|| 1), Some(1));
+        gate.close();
+        let mut ran = false;
+        assert_eq!(gate.run(|| ran = true), None);
+        assert!(!ran);
+        gate.wait_idle(); // nothing running: returns at once
+    }
+
+    #[test]
+    fn quit_waits_for_a_swap_in_progress() {
+        let gate = Arc::new(SwapGate::default());
+        let finished = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = mpsc::channel();
+        let swapper = {
+            let (gate, finished) = (Arc::clone(&gate), Arc::clone(&finished));
+            std::thread::spawn(move || {
+                gate.run(|| {
+                    started_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(300));
+                    finished.store(true, Ordering::SeqCst);
+                })
+            })
+        };
+        started_rx.recv().unwrap();
+        // Quit begins mid-swap: close never blocks, wait_idle returns only afterwards.
+        gate.close();
+        gate.wait_idle();
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "exited between the renames"
+        );
+        assert_eq!(swapper.join().unwrap(), Some(()));
+    }
+
+    #[test]
+    fn handoff_resumes_only_when_the_user_was_connected() {
+        let plain = handoff_args(42, "0.2.0", false);
+        assert_eq!(plain, ["--post-update", "42", "--updated-from", "0.2.0"]);
+        let resume = handoff_args(42, "0.2.0", true);
+        assert_eq!(resume.last().map(String::as_str), Some(RESUME_ARG));
+    }
+
+    /// Runs [`update_check_loop`] on a thread with a fake `check` that records the
+    /// `skipped` argument and finds `v0.3.0` only when nothing is skipped.
+    struct LoopHarness {
+        requests: Option<mpsc::Sender<UpdateRequest>>,
+        calls: mpsc::Receiver<Option<String>>,
+        reports: mpsc::Receiver<(bool, bool)>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl LoopHarness {
+        fn start(auto: bool, skipped: Option<&str>, timing: LoopTiming) -> LoopHarness {
+            let (req_tx, req_rx) = mpsc::channel();
+            let (call_tx, calls) = mpsc::channel();
+            let (report_tx, reports) = mpsc::channel();
+            let skipped = skipped.map(str::to_string);
+            let thread = std::thread::spawn(move || {
+                let auto = AtomicBool::new(auto);
+                let check = |skipped: Option<&str>| {
+                    call_tx.send(skipped.map(str::to_string)).unwrap();
+                    Ok(skipped.is_none().then(|| release("v0.3.0")))
+                };
+                let report = |result: Result<Option<Release>, String>, manual: bool| {
+                    let found = matches!(result, Ok(Some(_)));
+                    report_tx.send((manual, found)).unwrap();
+                };
+                update_check_loop(&check, &auto, skipped, timing, &req_rx, &report);
+            });
+            LoopHarness {
+                requests: Some(req_tx),
+                calls,
+                reports,
+                thread: Some(thread),
+            }
+        }
+
+        fn send(&self, request: UpdateRequest) {
+            self.requests.as_ref().unwrap().send(request).unwrap();
+        }
+
+        fn next_call(&self) -> Option<String> {
+            self.calls
+                .recv_timeout(Duration::from_secs(10))
+                .expect("a check")
+        }
+
+        fn next_report(&self) -> (bool, bool) {
+            self.reports
+                .recv_timeout(Duration::from_secs(10))
+                .expect("a report")
+        }
+    }
+
+    impl Drop for LoopHarness {
+        fn drop(&mut self) {
+            self.requests.take();
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn updates_are_checked_at_start_and_then_periodically() {
+        let timing = LoopTiming {
+            first: Duration::from_millis(20),
+            period: Duration::from_millis(40),
+        };
+        let harness = LoopHarness::start(true, None, timing);
+        // Start-up check (production: a few seconds after start, whatever the last
+        // check was), then the periodic ones.
+        for _ in 0..3 {
+            assert_eq!(harness.next_call(), None);
+            assert_eq!(harness.next_report(), (false, true));
+        }
+        assert!(LoopTiming::PRODUCTION.first <= Duration::from_secs(10));
+        assert_eq!(LoopTiming::PRODUCTION.period, view::UPDATE_PERIOD);
+    }
+
+    #[test]
+    fn check_now_ignores_and_forgets_a_skipped_version() {
+        let timing = LoopTiming {
+            first: Duration::from_millis(10),
+            period: Duration::from_millis(50),
+        };
+        let harness = LoopHarness::start(true, Some("v0.3.0"), timing);
+        // Automatic checks honour the skip (nothing found).
+        assert_eq!(harness.next_call().as_deref(), Some("v0.3.0"));
+        assert_eq!(harness.next_report(), (false, false));
+        // "Check now" does not, and finds the skipped release...
+        harness.send(UpdateRequest::CheckNow);
+        loop {
+            let call = harness.next_call();
+            let report = harness.next_report();
+            if report.0 {
+                assert_eq!(call, None);
+                assert_eq!(report, (true, true));
+                break;
+            }
+        }
+        // ...which undoes the skip for later automatic checks too.
+        assert_eq!(harness.next_call(), None);
+        assert_eq!(harness.next_report(), (false, true));
+    }
+
+    #[test]
+    fn automatic_checks_respect_the_switch_but_check_now_does_not() {
+        let timing = LoopTiming {
+            first: Duration::from_millis(10),
+            period: Duration::from_millis(10),
+        };
+        let harness = LoopHarness::start(false, Some("v0.3.0"), timing);
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(
+            harness.calls.try_recv().is_err(),
+            "automatic updates are off"
+        );
+        harness.send(UpdateRequest::CheckNow);
+        assert_eq!(harness.next_call(), None);
+        assert_eq!(harness.next_report(), (true, true));
     }
 
     #[test]

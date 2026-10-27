@@ -3,6 +3,7 @@
 //! so everything is unit tested.
 
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use winpods_airplay::types::{DEFAULT_RENDER_MS, MAX_LATENCY_MS, MIN_LATENCY_MS};
@@ -205,6 +206,56 @@ pub fn effective_address<'a>(snap: &'a Snapshot, saved_ip: &'a str) -> &'a str {
         saved_ip.trim()
     } else {
         snap.device_ip.trim()
+    }
+}
+
+/// Shown under the speaker card when Connect is pressed before an address is set.
+pub const NO_ADDRESS_HINT: &str =
+    "No speaker address set: enter the HomePod's IP address or use Find in Settings.";
+
+/// The line under the speaker card: the engine's error while it is in `Error` or
+/// `Reconnecting`, else [`NO_ADDRESS_HINT`] when Connect was pressed without an
+/// address, else nothing.
+pub fn error_line(snap: &Snapshot, no_address_hint: bool) -> String {
+    let engine_error = match snap.state {
+        State::Error | State::Reconnecting => snap.error.trim(),
+        _ => "",
+    };
+    if !engine_error.is_empty() {
+        engine_error.to_string()
+    } else if no_address_hint {
+        NO_ADDRESS_HINT.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// The snapshot as the card and the tray show it. The engine's `Error` state only means
+/// "no speaker address" (it gives up until the next Connect), so once an address is
+/// known and no connection is wanted, that error is stale and is shown as
+/// `Disconnected`. While a connection is wanted the engine's state is shown as is.
+pub fn presented(snap: &Arc<Snapshot>, saved_ip: &str, wants: bool) -> Arc<Snapshot> {
+    let stale_error =
+        snap.state == State::Error && !wants && !effective_address(snap, saved_ip).is_empty();
+    if !stale_error {
+        return Arc::clone(snap);
+    }
+    Arc::new(Snapshot {
+        state: State::Disconnected,
+        error: String::new(),
+        ..Snapshot::clone(snap)
+    })
+}
+
+/// True when `latest` lists other capture devices than `known` (compared by value:
+/// the engine publishes a new list on every refresh, even an unchanged one).
+pub fn devices_changed(
+    known: Option<&Arc<Vec<DeviceInfo>>>,
+    latest: &Arc<Vec<DeviceInfo>>,
+) -> bool {
+    match known {
+        None => true,
+        Some(known) => !Arc::ptr_eq(known, latest) && **known != **latest,
     }
 }
 
@@ -600,19 +651,16 @@ pub fn option_value<'a>(options: &[&'a str], index: i32, default: usize) -> &'a 
 
 /// Time between automatic update checks.
 pub const UPDATE_PERIOD: Duration = Duration::from_secs(24 * 3600);
-/// Delay of the first check after start-up (keeps start-up quiet).
+/// Delay of the check that runs at every start (keeps start-up quiet). Checking at
+/// start (plan) also brings back an update that was found before a restart.
 pub const UPDATE_STARTUP_DELAY: Duration = Duration::from_secs(5);
 
-/// When to run the first automatic update check, given the last successful one
-/// (unix seconds): soon if it is due, else when 24 h have passed.
-pub fn update_first_delay(now_unix: u64, last_check: Option<u64>) -> Duration {
-    let Some(last) = last_check else {
-        return UPDATE_STARTUP_DELAY;
-    };
-    let elapsed = Duration::from_secs(now_unix.saturating_sub(last));
-    UPDATE_PERIOD
-        .saturating_sub(elapsed)
-        .max(UPDATE_STARTUP_DELAY)
+/// True when the last successful check (unix seconds) is a full period ago, or there
+/// was none. A clock that went backwards does not count as due.
+pub fn update_check_due(now_unix: u64, last_check: Option<u64>) -> bool {
+    last_check.is_none_or(|last| {
+        Duration::from_secs(now_unix.saturating_sub(last)) >= UPDATE_PERIOD && now_unix >= last
+    })
 }
 
 /// Back-off after `failures` consecutive failed checks: 1, 5, then 30 minutes.
@@ -637,8 +685,6 @@ pub fn format_ago(now_unix: u64, then_unix: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
 
     fn device(id: &str, name: &str, kind: DeviceKind) -> DeviceInfo {
@@ -1043,6 +1089,65 @@ mod tests {
     }
 
     #[test]
+    fn error_line_prefers_the_engine_then_the_address_hint() {
+        let mut snap = Snapshot::default();
+        assert_eq!(error_line(&snap, false), "");
+        assert_eq!(error_line(&snap, true), NO_ADDRESS_HINT);
+        snap.state = State::Reconnecting;
+        snap.error = " connect timed out ".into();
+        assert_eq!(error_line(&snap, true), "connect timed out");
+        snap.state = State::Error;
+        assert_eq!(error_line(&snap, false), "connect timed out");
+        // A stale error text outside Error/Reconnecting is not shown.
+        snap.state = State::Disconnected;
+        assert_eq!(error_line(&snap, false), "");
+        snap.state = State::Streaming;
+        assert_eq!(error_line(&snap, true), NO_ADDRESS_HINT);
+    }
+
+    #[test]
+    fn a_no_address_error_is_stale_once_an_address_is_set() {
+        let error = Arc::new(Snapshot {
+            state: State::Error,
+            error: "No speaker address set: enter the HomePod's IP or use Find...".into(),
+            ..Snapshot::default()
+        });
+        // Still no address: the error stays.
+        assert_eq!(presented(&error, "", false).state, State::Error);
+        // The user set one (the engine keeps Error until the next Connect): shown as
+        // Disconnected, with no error line and a neutral tray icon.
+        let shown = presented(&error, "192.168.1.20", false);
+        assert_eq!(shown.state, State::Disconnected);
+        assert_eq!(error_line(&shown, false), "");
+        assert_eq!(tray_tooltip(&shown, "x"), "WinPods - Disconnected");
+        assert_eq!(status_text(&shown, true), "Disconnected");
+        // While a connection is wanted the engine's state is shown unchanged.
+        assert_eq!(presented(&error, "192.168.1.20", true).state, State::Error);
+        // Other states are passed through untouched (same Arc).
+        let streaming = Arc::new(streaming());
+        assert!(Arc::ptr_eq(
+            &presented(&streaming, "192.168.1.20", false),
+            &streaming
+        ));
+    }
+
+    #[test]
+    fn device_lists_are_compared_by_value() {
+        let list = Arc::new(vec![device("lb1", "Speakers", DeviceKind::Loopback)]);
+        assert!(devices_changed(None, &list));
+        assert!(!devices_changed(Some(&list), &list));
+        // A refresh publishes an equal list in a new Arc: not a change.
+        let same = Arc::new(list.as_ref().clone());
+        assert!(!devices_changed(Some(&list), &same));
+        let plugged = Arc::new(vec![
+            device("lb1", "Speakers", DeviceKind::Loopback),
+            device("usb", "USB DAC", DeviceKind::Loopback),
+        ]);
+        assert!(devices_changed(Some(&list), &plugged));
+        assert!(devices_changed(Some(&plugged), &list));
+    }
+
+    #[test]
     fn discovered_names_are_persisted_only_for_the_saved_address() {
         let snap = Snapshot {
             device_ip: "10.0.0.2".into(),
@@ -1099,20 +1204,13 @@ mod tests {
     #[test]
     fn update_schedule() {
         let day = 24 * 3600;
-        assert_eq!(update_first_delay(1_000_000, None), UPDATE_STARTUP_DELAY);
-        assert_eq!(
-            update_first_delay(1_000_000, Some(1_000_000 - day - 5)),
-            UPDATE_STARTUP_DELAY
-        );
-        assert_eq!(
-            update_first_delay(1_000_000, Some(1_000_000 - 3600)),
-            Duration::from_secs(day - 3600)
-        );
-        // A clock that went backwards does not postpone checks forever.
-        assert_eq!(
-            update_first_delay(1_000_000, Some(2_000_000)),
-            UPDATE_PERIOD
-        );
+        assert!(UPDATE_STARTUP_DELAY < Duration::from_secs(60));
+        assert!(update_check_due(1_000_000, None));
+        assert!(update_check_due(1_000_000, Some(1_000_000 - day)));
+        assert!(update_check_due(1_000_000, Some(1_000_000 - day - 5)));
+        assert!(!update_check_due(1_000_000, Some(1_000_000 - 3600)));
+        // A clock that went backwards is not "due".
+        assert!(!update_check_due(1_000_000, Some(2_000_000)));
         assert_eq!(update_retry_delay(0), Duration::from_secs(60));
         assert_eq!(update_retry_delay(1), Duration::from_secs(300));
         assert_eq!(update_retry_delay(2), Duration::from_secs(1800));

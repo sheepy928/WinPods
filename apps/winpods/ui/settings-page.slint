@@ -172,22 +172,28 @@ export component SettingsPage inherits Rectangle {
                     }
                 }
             }
-            if App.update-available: InfoBar {
-                title: "WinPods " + App.update-version + " is available";
-                message: App.update-can-install ? "Downloads, verifies the signature and restarts WinPods. Streaming resumes automatically." : "Download the new version from the release page.";
-                Button {
+            if App.update-available || App.update-error != "": InfoBar {
+                title: App.update-available ? "WinPods " + App.update-version + " is available" : "WinPods update";
+                message: App.update-busy ? App.update-status : App.update-error != "" ? (App.update-available ? App.update-error + (App.update-can-install ? " Try again." : " Download the new version from the release page.") : App.update-error) : App.update-can-install ? "Downloads, verifies the signature and restarts WinPods." + (App.connect-on ? " Streaming resumes automatically." : "") : "Download the new version from the release page.";
+                if App.update-available: Button {
                     text: "Skip this version";
                     enabled: !App.update-busy;
                     clicked => {
                         App.skip-update();
                     }
                 }
-                Button {
+                if App.update-available: Button {
                     text: App.update-can-install ? "Install & restart" : "Open release page";
                     primary: true;
                     enabled: !App.update-busy;
                     clicked => {
                         App.install-update();
+                    }
+                }
+                if !App.update-available: Button {
+                    text: "Dismiss";
+                    clicked => {
+                        App.dismiss-update-error();
                     }
                 }
             }

@@ -30,7 +30,12 @@ export component MainPage inherits Rectangle {
         return 5;
     }
 
-    ScrollView {
+    // Scroll the page by a wheel delta (used where a control must not take the wheel).
+    function scroll-page(delta: length) {
+        scroller.content-y = max(min(0px, scroller.visible-height - scroller.content-height), min(0px, scroller.content-y + delta));
+    }
+
+    scroller := ScrollView {
         horizontal-scrollbar-policy: always-off;
         VerticalLayout {
             padding-left: Theme.page-padding;
@@ -69,15 +74,22 @@ export component MainPage inherits Rectangle {
                 }
             }
 
-            if App.update-available: InfoBar {
-                title: "WinPods " + App.update-version + " is available";
-                message: App.update-busy ? App.update-status : App.update-can-install ? "Installs in a few seconds; streaming resumes on its own." : "Download it from the release page.";
-                Button {
+            // Also shown after a failed install (update-error), until the next check.
+            if App.update-available || App.update-error != "": InfoBar {
+                title: App.update-available ? "WinPods " + App.update-version + " is available" : "WinPods update";
+                message: App.update-busy ? App.update-status : App.update-error != "" ? (App.update-available ? App.update-error + (App.update-can-install ? " Try again." : " Download it from the release page.") : App.update-error) : App.update-can-install ? (App.connect-on ? "Installs in a few seconds; streaming resumes on its own." : "Installs in a few seconds and restarts WinPods.") : "Download it from the release page.";
+                if App.update-available: Button {
                     text: App.update-can-install ? "Install & restart" : "Open release page";
                     primary: true;
                     enabled: !App.update-busy;
                     clicked => {
                         App.install-update();
+                    }
+                }
+                if !App.update-available: Button {
+                    text: "Dismiss";
+                    clicked => {
+                        App.dismiss-update-error();
                     }
                 }
             }
@@ -176,6 +188,13 @@ export component MainPage inherits Rectangle {
                     model: App.sources;
                     current-index <=> App.source-index;
                     accessible-label: "Audio source";
+                    // Opening the list (click or keyboard focus) re-enumerates devices,
+                    // so newly plugged-in ones show up.
+                    changed has-focus => {
+                        if self.has-focus {
+                            App.refresh-sources();
+                        }
+                    }
                     selected => {
                         App.source-selected(self.current-index);
                     }
@@ -210,15 +229,35 @@ export component MainPage inherits Rectangle {
                 if App.latency-custom: HorizontalLayout {
                     spacing: 10px;
                     alignment: start;
-                    SpinBox {
+                    Rectangle {
                         width: 132px;
-                        minimum: 75;
-                        maximum: 5000;
-                        step-size: 5;
-                        value <=> App.latency-ms;
-                        accessible-label: "Custom latency in milliseconds";
-                        edited(value) => {
-                            App.latency-custom-edited(value);
+                        height: latency-spin.min-height;
+                        latency-spin := SpinBox {
+                            width: parent.width;
+                            height: parent.height;
+                            minimum: 75;
+                            maximum: 5000;
+                            step-size: 5;
+                            value <=> App.latency-ms;
+                            accessible-label: "Custom latency in milliseconds";
+                            edited(value) => {
+                                App.latency-custom-edited(value);
+                            }
+                        }
+                        // Until the SpinBox has focus, the mouse wheel scrolls the page
+                        // instead of changing the latency (which restarts the stream).
+                        // A click gives it focus; from then on it works as usual.
+                        TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            enabled: !latency-spin.has-focus;
+                            clicked => {
+                                latency-spin.focus();
+                            }
+                            scroll-event(event) => {
+                                root.scroll-page(event.delta-y);
+                                accept
+                            }
                         }
                     }
                     Text {
