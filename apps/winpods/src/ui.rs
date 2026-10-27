@@ -61,8 +61,9 @@ pub struct UiContext {
     /// Connect at start even when "Connect automatically" is off: this process was
     /// started by a self-update while the user was connected (`--resume`).
     pub resume_connection: bool,
-    /// Primary-instance guard: the UI registers the activation handler and drops the
-    /// guard as soon as Quit (or the update hand-off) begins.
+    /// Primary-instance guard: the UI registers the activation handler. Once Quit (or
+    /// the update hand-off) begins, activations are no longer acknowledged and the
+    /// guard is kept until the process exits (see [`activation_handler`]).
     pub instance: Option<InstanceGuard>,
     /// `None` disables update checks (demo mode). A temp copy still checks; it is only
     /// offered the release page, never an in-place install.
@@ -204,6 +205,27 @@ fn post(event: UiEvent) {
     if let Err(err) = slint::invoke_from_event_loop(move || with_controller(|c| c.handle(event))) {
         tracing::debug!("UI event dropped (event loop gone): {err}");
     }
+}
+
+/// Activation handler for the single-instance guard (it runs on the guard's listener
+/// thread, which acknowledges once the handler returns). Normally it calls `activate`
+/// (show the window) and returns. Once `closed` is set (quitting), it never returns,
+/// so the new launch gets no acknowledgement: it then waits for this process to exit
+/// (it holds the mutex until then) and starts normally. Acknowledging would make it
+/// give up while this process goes away, so starting WinPods again would do nothing.
+fn activation_handler(
+    closed: Arc<AtomicBool>,
+    activate: impl Fn() + Send + 'static,
+) -> Box<dyn Fn() + Send + 'static> {
+    Box::new(move || {
+        if closed.load(Ordering::Acquire) {
+            tracing::info!("WinPods was started again while quitting; it starts once we exit");
+            loop {
+                std::thread::park();
+            }
+        }
+        activate();
+    })
 }
 
 /// Requests to the update-check thread.
@@ -437,6 +459,8 @@ struct Controller {
     tray: RefCell<Option<Box<dyn Tray>>>,
     shutdown: RefCell<Option<Box<dyn FnOnce() + Send>>>,
     instance: RefCell<Option<InstanceGuard>>,
+    /// Set when quitting begins: activations from then on are left unanswered.
+    activations_closed: Arc<AtomicBool>,
     update_tx: RefCell<Option<mpsc::Sender<UpdateRequest>>>,
     auto_update: Arc<AtomicBool>,
     swap_gate: Arc<SwapGate>,
@@ -583,6 +607,7 @@ impl Controller {
             tray: RefCell::new(None),
             shutdown: RefCell::new(Some(ctx.shutdown)),
             instance: RefCell::new(ctx.instance),
+            activations_closed: Arc::default(),
             update_tx: RefCell::new(None),
             auto_update,
             swap_gate: Arc::default(),
@@ -663,7 +688,10 @@ impl Controller {
             self.reconcile_autostart();
             self.start_update_checks();
             if let Some(guard) = self.instance.borrow().as_ref() {
-                guard.on_activate(Box::new(|| post(UiEvent::Activate)));
+                guard.on_activate(activation_handler(
+                    Arc::clone(&self.activations_closed),
+                    || post(UiEvent::Activate),
+                ));
             }
         } else {
             self.app().set_autostart_note(shared(
@@ -950,10 +978,18 @@ impl Controller {
         }
         // No exe swap may start from here on; one in progress is waited for below.
         self.swap_gate.close();
-        // Release the single-instance mutex now: WinPods started again while this
-        // process is still stopping the engine becomes the new instance, instead of
-        // "activating" this one, which would ignore it.
-        self.instance.borrow_mut().take();
+        // WinPods started again from now on is not acknowledged: it waits for this
+        // process to exit and then starts normally (main.rs), instead of "activating"
+        // an instance that is going away. Until then this process keeps the
+        // single-instance mutex, so the two engines never overlap (the new one would
+        // find UDP 319/320 busy and pair with the speaker while our session is still
+        // up). The OS closes the mutex when the process exits; the guard is never
+        // dropped, because dropping joins its listener thread, which an activation
+        // arriving from now on parks for good.
+        self.activations_closed.store(true, Ordering::Release);
+        if let Some(guard) = self.instance.borrow_mut().take() {
+            std::mem::forget(guard);
+        }
         self.tick_timer.stop();
         self.latency_timer.stop();
         self.volume_timer.stop();
@@ -1704,7 +1740,7 @@ impl Controller {
                             format!("Restarting into WinPods {}…", release.version);
                         self.push_update_ui();
                         // The new process waits for this one to exit before starting
-                        // its engine: stop ours, hide the tray, release the mutex, quit.
+                        // its engine: stop ours, hide the tray, quit.
                         self.begin_shutdown();
                     }
                     Err(err) => {
@@ -1903,6 +1939,36 @@ fn demo_release() -> Release {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activations_are_answered_until_quitting_begins() {
+        let closed = Arc::new(AtomicBool::new(false));
+        let (shown_tx, shown_rx) = mpsc::channel();
+        let shown_tx = Mutex::new(shown_tx);
+        let handler = activation_handler(Arc::clone(&closed), move || {
+            shown_tx.lock().unwrap().send(()).unwrap();
+        });
+
+        // Normal: the window is shown and the handler returns (the guard then acks).
+        handler();
+        assert!(shown_rx.try_recv().is_ok());
+
+        // Quitting: the handler neither shows the window nor returns, so the new
+        // launch gets no ack and waits for this process to exit.
+        closed.store(true, Ordering::Release);
+        let (returned_tx, returned_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            handler();
+            let _ = returned_tx.send(());
+        });
+        assert_eq!(
+            returned_rx.recv_timeout(Duration::from_millis(300)),
+            Err(RecvTimeoutError::Timeout),
+            "an activation while quitting must not be acknowledged"
+        );
+        assert!(shown_rx.try_recv().is_err());
+        // The parked thread ends with the test process, as the listener does in the app.
+    }
 
     #[test]
     fn status_kinds_map_to_slint_enum() {
@@ -2274,5 +2340,192 @@ mod tests {
     #[test]
     fn notices_are_bundled() {
         assert!(THIRD_PARTY_NOTICES.contains("Slint"));
+    }
+
+    /// The custom-latency box on the main page: driven with real pointer and key
+    /// events in a headless window (software renderer, no screen).
+    mod wheel_safe_spin_box {
+        use std::rc::Rc;
+
+        use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
+        use slint::platform::{Key, Platform, PointerEventButton, WindowAdapter, WindowEvent};
+        use slint::{ComponentHandle, LogicalPosition, PhysicalSize, PlatformError};
+
+        #[allow(clippy::all, clippy::pedantic, missing_docs, unused_qualifications)]
+        mod harness {
+            slint::slint! {
+                #[style = "fluent"]
+                import { WheelSafeSpinBox } from "../ui/wheel-safe-spinbox.slint";
+
+                export component Harness inherits Window {
+                    width: 300px;
+                    height: 120px;
+                    in-out property <int> value: 100;
+                    out property <int> edits;
+                    out property <length> page-scrolled;
+                    out property <bool> spin-focused: spin.has-focus;
+                    out property <bool> spin-armed: spin.armed;
+                    spin := WheelSafeSpinBox {
+                        x: 10px;
+                        y: 10px;
+                        width: 132px;
+                        minimum: 75;
+                        maximum: 5000;
+                        step-size: 5;
+                        value <=> root.value;
+                        edited(value) => {
+                            root.edits += 1;
+                        }
+                        scroll-page(delta) => {
+                            root.page-scrolled += delta;
+                        }
+                    }
+                    // Something else that takes focus when clicked.
+                    FocusScope {
+                        x: 200px;
+                        y: 60px;
+                        width: 80px;
+                        height: 40px;
+                    }
+                }
+            }
+        }
+        use harness::Harness;
+
+        struct HeadlessPlatform(Rc<MinimalSoftwareWindow>);
+
+        impl Platform for HeadlessPlatform {
+            fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
+                Ok(self.0.clone())
+            }
+        }
+
+        struct Driver {
+            ui: Harness,
+        }
+
+        impl Driver {
+            fn pump(&self) {
+                // Runs the `changed` handlers, as each event-loop iteration does.
+                slint::platform::update_timers_and_animations();
+            }
+
+            fn send(&self, event: WindowEvent) {
+                self.ui.window().dispatch_event(event);
+                self.pump();
+            }
+
+            fn move_to(&self, x: f32, y: f32) {
+                self.send(WindowEvent::PointerMoved {
+                    position: LogicalPosition::new(x, y),
+                });
+            }
+
+            fn click(&self, x: f32, y: f32) {
+                self.move_to(x, y);
+                let position = LogicalPosition::new(x, y);
+                let button = PointerEventButton::Left;
+                self.send(WindowEvent::PointerPressed { position, button });
+                self.send(WindowEvent::PointerReleased { position, button });
+            }
+
+            /// One wheel notch "up" (which a plain SpinBox turns into +step).
+            fn wheel(&self, x: f32, y: f32) {
+                self.move_to(x, y);
+                self.send(WindowEvent::PointerScrolled {
+                    position: LogicalPosition::new(x, y),
+                    delta_x: 0.0,
+                    delta_y: 40.0,
+                });
+            }
+
+            fn key(&self, text: slint::SharedString) {
+                self.send(WindowEvent::KeyPressed { text: text.clone() });
+                self.send(WindowEvent::KeyReleased { text });
+            }
+        }
+
+        #[test]
+        fn the_wheel_scrolls_the_page_unless_the_box_was_just_clicked() {
+            let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+            slint::platform::set_platform(Box::new(HeadlessPlatform(window.clone())))
+                .expect("a fresh test thread has no Slint platform yet");
+            let ui = Harness::new().unwrap();
+            ui.show().unwrap();
+            window.set_size(PhysicalSize::new(300, 120));
+            let d = Driver { ui };
+            let ui = &d.ui;
+
+            // Box at x 10..142, y 10..~40: text, then the up and down arrows.
+            let (text_x, up_x, down_x, row_y) = (40.0, 94.0, 126.0, 25.0);
+            let outside = (250.0, 20.0);
+
+            // Never touched: the wheel over it scrolls the page.
+            d.wheel(text_x, row_y);
+            assert_eq!(ui.get_value(), 100);
+            assert_eq!(ui.get_edits(), 0);
+            assert_eq!(ui.get_page_scrolled(), 40.0);
+            assert!(!ui.get_spin_focused());
+
+            // A click arms it: now the wheel changes the value, as a SpinBox does.
+            d.click(text_x, row_y);
+            assert!(ui.get_spin_focused() && ui.get_spin_armed());
+            d.wheel(text_x, row_y);
+            assert_eq!(ui.get_value(), 105);
+            assert_eq!(ui.get_edits(), 1);
+            assert_eq!(ui.get_page_scrolled(), 40.0);
+
+            // The pointer leaves: disarmed, though it keeps focus (typing still works).
+            d.move_to(outside.0, outside.1);
+            assert!(!ui.get_spin_armed());
+            assert!(ui.get_spin_focused());
+            d.wheel(text_x, row_y);
+            assert_eq!(ui.get_value(), 105, "scrolling the page past it");
+            assert_eq!(ui.get_page_scrolled(), 80.0);
+            d.key("0".into());
+            assert_eq!(ui.get_value(), 1050);
+
+            // Enter (accepting a typed value) disarms it as well.
+            d.click(text_x, row_y);
+            assert!(ui.get_spin_armed());
+            d.key(Key::Return.into());
+            assert!(!ui.get_spin_armed());
+            d.wheel(text_x, row_y);
+            assert_eq!(ui.get_value(), 1050);
+            assert_eq!(ui.get_page_scrolled(), 120.0);
+
+            // So does Escape.
+            d.click(text_x, row_y);
+            assert!(ui.get_spin_armed());
+            d.key(Key::Escape.into());
+            assert!(!ui.get_spin_armed());
+
+            // Losing focus (Tab, the pointer still over it) disarms it.
+            d.click(text_x, row_y);
+            assert!(ui.get_spin_armed());
+            d.key(Key::Tab.into());
+            assert!(!ui.get_spin_focused());
+            assert!(!ui.get_spin_armed());
+            d.wheel(text_x, row_y);
+            assert_eq!(ui.get_value(), 1050);
+            assert_eq!(ui.get_page_scrolled(), 160.0);
+
+            // The first click on an arrow both arms the box and steps the value; the
+            // arrows then work as usual.
+            let edits = ui.get_edits();
+            d.click(up_x, row_y);
+            assert!(ui.get_spin_focused() && ui.get_spin_armed());
+            assert_eq!(ui.get_value(), 1055);
+            d.click(down_x, row_y);
+            d.click(down_x, row_y);
+            assert_eq!(ui.get_value(), 1045);
+            assert_eq!(ui.get_edits(), edits + 3);
+
+            // And the first click on the down arrow steps down.
+            d.click(240.0, 80.0);
+            d.click(down_x, row_y);
+            assert_eq!(ui.get_value(), 1040);
+            assert_eq!(ui.get_page_scrolled(), 160.0);
+        }
     }
 }

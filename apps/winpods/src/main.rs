@@ -14,7 +14,9 @@
 //!
 //! The single-instance decision comes first, before config or logging: a second
 //! launch only signals the running instance and exits, without rotating or writing
-//! its log or touching config.
+//! its log or touching config. A running instance that is quitting does not answer
+//! and keeps the mutex until its process has exited; the second launch then waits for
+//! it and starts normally ([`second_launch`]), so two engines never overlap.
 
 #![windows_subsystem = "windows"]
 
@@ -38,6 +40,13 @@ use winpods_engine::{EngineApi, EngineHandle, EngineSettings};
 /// How long an updated process waits for the previous one to exit (it stops its
 /// engine first, which takes at most ~8 s).
 const PREVIOUS_EXIT_WAIT: Duration = Duration::from_secs(30);
+
+/// How long a second launch waits for the running instance to answer the activation.
+const ACTIVATION_ACK_WAIT: Duration = Duration::from_millis(1500);
+
+/// How long a second launch waits for a running WinPods 0.2 that did not answer: it
+/// is quitting (it stops its engine in at most ~8 s, then exits) or hung.
+const UNANSWERED_INSTANCE_WAIT: Duration = Duration::from_secs(12);
 
 #[derive(Debug, Default)]
 struct Args {
@@ -64,6 +73,70 @@ fn parse_args(raw: &[String]) -> Args {
         }
     }
     args
+}
+
+/// What a launch that found another instance does.
+#[derive(Debug, PartialEq, Eq)]
+enum SecondLaunch<G> {
+    /// The other instance exited meanwhile: start normally with this guard.
+    Primary(G),
+    /// Nothing more to do (the running instance showed its window, or a tray start).
+    Exit,
+    /// Say that WinPods is already running (an older, elevated or hung instance).
+    AlreadyRunning,
+}
+
+/// Decide what a launch that is not the primary instance does. `signal` asks the
+/// running instance to show its window (true = acknowledged); `answers_activations`
+/// tells whether a WinPods 0.2 holds the activation event (v0.1 has none, and an
+/// elevated instance's is not ours to open); `acquire` retries the single-instance
+/// mutex for the given time. A 0.2 instance that is quitting does not acknowledge and
+/// keeps the mutex until its process has exited, so waiting for the mutex starts this
+/// launch as soon as it is gone, without two engines ever running at once.
+fn second_launch<G>(
+    minimized: bool,
+    signal: impl FnOnce() -> bool,
+    answers_activations: impl FnOnce() -> bool,
+    acquire: impl FnOnce(Duration) -> Option<G>,
+) -> SecondLaunch<G> {
+    if minimized {
+        // Start with Windows: never show anything.
+        return SecondLaunch::Exit;
+    }
+    if signal() {
+        return SecondLaunch::Exit;
+    }
+    // Without the event, one more immediate try covers an instance that exited just now.
+    let wait = if answers_activations() {
+        UNANSWERED_INSTANCE_WAIT
+    } else {
+        Duration::ZERO
+    };
+    match acquire(wait) {
+        Some(guard) => SecondLaunch::Primary(guard),
+        None => SecondLaunch::AlreadyRunning,
+    }
+}
+
+/// True when a WinPods 0.2 instance's activation event exists and we may set it (the
+/// access `single_instance::signal_existing` needs).
+fn activation_event_exists() -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW};
+    use windows::core::HSTRING;
+
+    let name = HSTRING::from(single_instance::ACTIVATE_EVENT_NAME);
+    // SAFETY: plain Win32 call; the returned handle is closed below.
+    match unsafe { OpenEventW(EVENT_MODIFY_STATE, false, &name) } {
+        Ok(handle) => {
+            // SAFETY: closing the handle opened above exactly once.
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Wait up to `timeout` for process `pid` to exit. True when it has exited (or no
@@ -113,15 +186,25 @@ fn main() -> anyhow::Result<()> {
     };
     let instance = match single_instance::acquire(retry) {
         Ok(Instance::Primary(guard)) => guard,
-        Ok(Instance::Secondary) => {
-            if !args.minimized && !single_instance::signal_existing(Duration::from_millis(1500)) {
+        Ok(Instance::Secondary) => match second_launch(
+            args.minimized,
+            || single_instance::signal_existing(ACTIVATION_ACK_WAIT),
+            activation_event_exists,
+            |wait| match single_instance::acquire(wait) {
+                Ok(Instance::Primary(guard)) => Some(guard),
+                Ok(Instance::Secondary) | Err(_) => None,
+            },
+        ) {
+            SecondLaunch::Primary(guard) => guard,
+            SecondLaunch::Exit => return Ok(()),
+            SecondLaunch::AlreadyRunning => {
                 message_box(
                     "WinPods is already running (possibly an older version, or one started as \
                      administrator). Quit it from its tray icon first.",
                 );
+                return Ok(());
             }
-            return Ok(());
-        }
+        },
         Err(err) => {
             let _log = logging::init(&Config::load().log_level, false);
             tracing::error!("single-instance check failed: {err}");
@@ -284,6 +367,71 @@ mod tests {
         assert!(!wait_for_exit(child.id(), Duration::from_millis(50)));
         assert!(wait_for_exit(child.id(), Duration::from_secs(20)));
         child.wait().unwrap();
+    }
+
+    #[test]
+    fn a_second_launch_activates_the_running_instance() {
+        let mut waited = None;
+        let outcome = second_launch(
+            false,
+            || true,
+            || panic!("not needed once acknowledged"),
+            |wait| -> Option<()> {
+                waited = Some(wait);
+                None
+            },
+        );
+        assert_eq!(outcome, SecondLaunch::Exit);
+        assert_eq!(waited, None);
+
+        // A tray start (--minimized) never signals nor waits.
+        let outcome = second_launch(
+            true,
+            || panic!("a tray start must not show the window"),
+            || panic!("no wait"),
+            |_| -> Option<()> { panic!("no wait") },
+        );
+        assert_eq!(outcome, SecondLaunch::Exit);
+    }
+
+    #[test]
+    fn a_second_launch_waits_for_an_instance_that_is_quitting() {
+        // No ack from a 0.2 instance: it is quitting; start once its mutex is gone.
+        let mut waited = None;
+        let outcome = second_launch(
+            false,
+            || false,
+            || true,
+            |wait| {
+                waited = Some(wait);
+                Some("guard")
+            },
+        );
+        assert_eq!(outcome, SecondLaunch::Primary("guard"));
+        assert_eq!(waited, Some(UNANSWERED_INSTANCE_WAIT));
+        // Long enough for the engine to stop (~8 s at most) and the process to exit.
+        assert!(UNANSWERED_INSTANCE_WAIT >= Duration::from_secs(10));
+
+        // Still there after the wait (hung): say so.
+        let outcome = second_launch(false, || false, || true, |_| -> Option<()> { None });
+        assert_eq!(outcome, SecondLaunch::AlreadyRunning);
+    }
+
+    #[test]
+    fn a_second_launch_reports_an_older_or_elevated_instance_at_once() {
+        // No activation event (v0.1, or an elevated instance): no long wait.
+        let mut waited = None;
+        let outcome = second_launch(
+            false,
+            || false,
+            || false,
+            |wait| -> Option<()> {
+                waited = Some(wait);
+                None
+            },
+        );
+        assert_eq!(outcome, SecondLaunch::AlreadyRunning);
+        assert_eq!(waited, Some(Duration::ZERO));
     }
 
     #[test]
