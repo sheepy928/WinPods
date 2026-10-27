@@ -7,24 +7,31 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Least privilege by default; only the publish job may write to the repository and
+# only the sign job sees the signing key.
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # The release public key (keys/winpods-update.pub), duplicated here so the sign and
+  # publish jobs need no checkout.
+  UPDATE_PUBLIC_KEY: RWR4XFKu09ClAU6GCwRPGdTypnI83Q+0G1DI3IfN32fhHMHojYpRHCcC
 
 jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # rust-toolchain.toml pins the exact toolchain; rustup installs it on first use.
       - name: Show toolchain
         run: rustup show active-toolchain
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Format
         run: cargo fmt --all --check
@@ -39,29 +46,30 @@ jobs:
       - name: Release build
         run: cargo build --release --locked -p winpods -p winpods-cli
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: WinPods-windows-x64
           path: |
             target/release/WinPods.exe
             target/release/winpods-cli.exe
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: WinPods-pdb
           path: target/release/*.pdb
 
-  release:
+  # Release packaging: builds the shipped executables with the real third-party
+  # notices embedded. No secrets, read-only token.
+  package:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
-    environment: release
-    permissions:
-      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Check tag matches the workspace version
         shell: pwsh
@@ -72,15 +80,21 @@ jobs:
             throw "tag $env:GITHUB_REF_NAME does not match workspace version $version"
           }
 
-      - name: Build
-        run: cargo build --release --locked -p winpods -p winpods-cli -p winpods-sign
-
+      # Before the build, so WinPods.exe embeds the generated notices (About page).
       - name: Third-party notices
         shell: pwsh
         run: |
           cargo install cargo-about --locked --features cli --version 0.9.3
           cargo about generate --workspace about.hbs -o notices-raw.html
           python tools/notices.py notices-raw.html THIRD-PARTY-NOTICES.html
+          cargo about generate --workspace about-txt.hbs -o notices-raw.txt
+          python tools/notices.py --text notices-raw.txt apps/winpods/assets/THIRD-PARTY-NOTICES.txt
+          if (Select-String -Quiet -SimpleMatch '(development build)' apps/winpods/assets/THIRD-PARTY-NOTICES.txt) {
+            throw 'notices were not generated'
+          }
+
+      - name: Build
+        run: cargo build --release --locked -p winpods -p winpods-cli
 
       - name: Package
         shell: pwsh
@@ -96,20 +110,112 @@ jobs:
           [IO.File]::WriteAllText("$PWD\out\SHA256SUMS.txt", ($lines -join "`n") + "`n")
           Get-Content out\SHA256SUMS.txt
 
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-out
+          path: out/
+          if-no-files-found: error
+
+  # The signing tool, built from its own small dependency tree (minisign,
+  # minisign-verify, anyhow) in a separate job without any cache, so nothing the
+  # main build runs can touch it.
+  signer:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Build winpods-sign
+        run: cargo build --release --locked -p winpods-sign
+
+      - name: Record hash
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force signer | Out-Null
+          Copy-Item target\release\winpods-sign.exe signer\
+          (Get-FileHash signer\winpods-sign.exe -Algorithm SHA256).Hash.ToLower() | Set-Content -NoNewline signer\winpods-sign.sha256
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signer
+          path: signer/
+          if-no-files-found: error
+
+  # Signs SHA256SUMS.txt. The only job with the signing key: no checkout, no cargo,
+  # no cache, no token permissions; the key is only in the signing step's environment.
+  sign:
+    needs: [package, signer]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    environment: release
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-out
+          path: out
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: signer
+          path: signer
+
+      - name: Check the signer
+        shell: pwsh
+        run: |
+          $expected = (Get-Content -Raw signer\winpods-sign.sha256).Trim()
+          $actual = (Get-FileHash signer\winpods-sign.exe -Algorithm SHA256).Hash.ToLower()
+          if ($expected -ne $actual) { throw "signer hash mismatch: $actual" }
+
       - name: Sign SHA256SUMS.txt
         shell: pwsh
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
         run: |
+          New-Item -ItemType Directory -Force sig | Out-Null
           if (-not $env:MINISIGN_SECRET_KEY) {
-            Write-Output "::warning::MINISIGN_SECRET_KEY is not set; publishing without a signature (auto-update will only offer the release page)"
+            Write-Output "::warning::MINISIGN_SECRET_KEY is not set; publishing WITHOUT a signature. WinPods only installs signed updates, so this release will not be offered as an automatic update."
             exit 0
           }
           $comment = "WinPods $($env:GITHUB_REF_NAME) windows-x64"
-          target\release\winpods-sign.exe sign - out\SHA256SUMS.txt $comment
-          $pub = (Get-Content keys\winpods-update.pub | Where-Object { $_ -notmatch '^untrusted comment' -and $_.Trim() })[0]
-          target\release\winpods-sign.exe verify $pub out\SHA256SUMS.txt
+          signer\winpods-sign.exe sign - out\SHA256SUMS.txt $comment
+          signer\winpods-sign.exe verify $env:UPDATE_PUBLIC_KEY out\SHA256SUMS.txt
+          Move-Item out\SHA256SUMS.txt.minisig sig\
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signature
+          path: sig/
+          if-no-files-found: ignore
+
+  # Publishes the release. Write token, but no secrets, no checkout and no downloaded
+  # executables (the sign job already verified the signature).
+  publish:
+    needs: sign
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-out
+          path: out
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: signature
+          path: out
+
+      - name: Note signature state
+        shell: pwsh
+        run: |
+          if (-not (Test-Path out\SHA256SUMS.txt.minisig)) { Write-Output "::warning::release is unsigned" }
 
       - name: Publish release
         shell: pwsh
@@ -118,4 +224,6 @@ jobs:
         run: |
           $tag = $env:GITHUB_REF_NAME
           $files = Get-ChildItem out -File | ForEach-Object { $_.FullName }
-          gh release create $tag @files --title "WinPods $tag" --generate-notes
+          $extra = @()
+          if ($tag -match '-') { $extra += '--prerelease' }
+          gh release create $tag @files --repo $env:GITHUB_REPOSITORY --title "WinPods $tag" --generate-notes @extra
