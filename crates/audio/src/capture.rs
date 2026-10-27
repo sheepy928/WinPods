@@ -23,7 +23,7 @@
 //! Everything after the device is open is device-independent: a `DrainLoop` reads a
 //! `PacketSource` (the WASAPI capture client in production) through a
 //! `PacketConverter` (silent packets, discontinuities, decoding, resampling, idle
-//! flush), so the loop is unit-tested against scripted packets.
+//! reset), so the loop is unit-tested against scripted packets.
 
 use std::any::Any;
 use std::panic::{self, AssertUnwindSafe};
@@ -90,8 +90,19 @@ pub enum CaptureError {
 /// on it (packets are drained as soon as they arrive); it only bounds how long the
 /// thread may stall before audio is lost.
 pub const BUFFER_DURATION: Duration = Duration::from_millis(100);
-/// Longest wait for a packet before the loop drains (and flushes the resampler)
-/// anyway.
+/// Longest wait for a packet before the loop drains anyway. A timeout with nothing
+/// queued means capture went quiet: the resampler is then reset, dropping the ~1.3 ms
+/// tail it still holds instead of publishing it, so the next sound starts from a
+/// clean filter.
+///
+/// The reset lands around the sender's own stall. The sender pads with silence after
+/// `max(latency - render - 5 ms clamped to 5..=250 ms, 40 ms)` of quiet
+/// (`StallPolicy::stall_ns` in winpods-airplay), which is at or before these 200 ms
+/// for latencies up to about 275 ms (the default is 100 ms). There a published tail
+/// would land after the silence already sent, out of place. With a longer latency
+/// the sender stalls at 201-250 ms, after the reset, and the tail could still have
+/// been padded in with the remainder; it is lost instead. Losing ~1.3 ms of a sound's
+/// end is accepted so capture does not depend on the sender's timing.
 pub const WAIT_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// State shared between the handle and its thread.
@@ -312,8 +323,32 @@ fn run_tone(
     tracing::info!("test tone started");
     let _ = setup.send(Ok(info));
     drop(setup);
-    let _mmcss = MmcssGuard::pro_audio();
+    let _mmcss = join_mmcss("tone");
     tone::pace(producer, &mut generator, &timer, shared.stop.handle())
+}
+
+/// Join the MMCSS "Pro Audio" task for the calling thread. A refusal is logged here,
+/// before the thread's loop starts: as a warning the first time, then at debug level.
+fn join_mmcss(thread: &str) -> Option<MmcssGuard> {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let guard = MmcssGuard::pro_audio();
+    if guard.is_none() {
+        // AvSetMmThreadCharacteristicsW leaves the reason in the thread's last error.
+        let error = std::io::Error::last_os_error();
+        let detail = match error.raw_os_error() {
+            Some(0) | None => String::new(),
+            Some(_) => format!(" ({error})"),
+        };
+        if WARNED.swap(true, Ordering::Relaxed) {
+            tracing::debug!("{thread} thread: MMCSS \"Pro Audio\" registration failed{detail}");
+        } else {
+            tracing::warn!(
+                "{thread} thread: MMCSS \"Pro Audio\" registration failed{detail}; it runs at \
+                 normal priority"
+            );
+        }
+    }
+    guard
 }
 
 /// WASAPI capture: open the endpoint, report, then run the drain loop.
@@ -342,7 +377,7 @@ fn run_wasapi(
     }
     let _ = setup.send(Ok(stream.info.clone()));
     drop(setup);
-    let _mmcss = MmcssGuard::pro_audio();
+    let _mmcss = join_mmcss("capture");
     let exit = stream
         .drain
         .run(stream.event.as_handle(), producer, shared, WAIT_TIMEOUT);
@@ -432,7 +467,7 @@ impl PacketSource for AudioCaptureClient {
 }
 
 /// Device-independent handling of captured packets: decode the mix format to stereo
-/// `f32`, resample to 44.1 kHz `i16`, count discontinuities and flush the resampler
+/// `f32`, resample to 44.1 kHz `i16`, count discontinuities and reset the resampler
 /// when capture goes quiet. Every buffer is allocated in [`PacketConverter::new`].
 struct PacketConverter {
     format: SampleFormat,
@@ -440,7 +475,7 @@ struct PacketConverter {
     block_align: usize,
     /// One packet decoded to stereo `f32` (sized for the largest packet).
     stereo: Vec<[f32; 2]>,
-    /// Resampled 44.1 kHz frames of one packet (or of one flush).
+    /// Resampled 44.1 kHz frames of one packet.
     frames: Vec<Frame>,
     resampler: StereoResampler,
     /// True until the first packet was converted. WASAPI flags that packet as a
@@ -513,15 +548,17 @@ impl PacketConverter {
     }
 
     /// End of one wake of the capture loop. When the wait timed out and no packet
-    /// was drained, capture went quiet: push the resampler's delayed tail out so the
-    /// end of a sound is not held back. Returns the frames to publish (none on any
-    /// other wake, and none again until more audio was converted).
-    fn after_wake(&mut self, signaled: bool, drained: usize) -> Result<&[Frame], ResampleError> {
-        if signaled || drained > 0 {
-            return Ok(&[]);
+    /// was drained, capture went quiet: reset the resampler (see [`WAIT_TIMEOUT`])
+    /// rather than publish its tail ~200 ms late, where (at the usual latencies) the
+    /// sender would put it after the silence it already sent. Returns true when it
+    /// reset (once per sound: not again until more audio was converted). Never
+    /// allocates.
+    fn after_wake(&mut self, signaled: bool, drained: usize) -> bool {
+        if signaled || drained > 0 || !self.resampler.has_tail() {
+            return false;
         }
-        let produced = self.resampler.flush(&mut self.frames)?;
-        Ok(&self.frames[..produced])
+        self.resampler.reset();
+        true
     }
 }
 
@@ -570,7 +607,7 @@ impl<S: PacketSource> DrainLoop<S> {
         }
     }
 
-    /// One wake: drain every queued packet, then flush the resampler if the wait
+    /// One wake: drain every queued packet, then reset the resampler if the wait
     /// timed out with nothing queued. Returns the device frames drained.
     fn wake(
         &mut self,
@@ -579,7 +616,7 @@ impl<S: PacketSource> DrainLoop<S> {
         discontinuities: &AtomicU64,
     ) -> Result<usize, StreamError> {
         let drained = self.drain(producer, discontinuities)?;
-        publish(producer, self.converter.after_wake(signaled, drained)?);
+        self.converter.after_wake(signaled, drained);
         Ok(drained)
     }
 
@@ -958,8 +995,11 @@ mod tests {
         let out = conv.packet(480, SILENT, &loud, &counter).unwrap();
         assert!(!out.is_empty());
         assert!(out.iter().all(|f| *f == [0, 0]));
-        let tail = conv.after_wake(false, 0).unwrap();
-        assert!(tail.iter().all(|f| *f == [0, 0]));
+        let out = conv.packet(480, SILENT, &loud, &counter).unwrap();
+        assert!(
+            out.iter().all(|f| *f == [0, 0]),
+            "the filter held only zeros"
+        );
         assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 
@@ -995,31 +1035,41 @@ mod tests {
         assert_eq!(count(), 4);
     }
 
+    /// The idle timeout comes 200 ms after capture went quiet (at or after the
+    /// sender's stall for latencies up to ~275 ms): the resampler's tail is dropped
+    /// there, never published late or prepended to the next sound.
     #[test]
-    fn idle_timeout_flushes_the_resampler_tail_once() {
+    fn idle_timeout_resets_the_resampler_instead_of_publishing_its_tail() {
         let counter = AtomicU64::new(0);
-        let raw = f32_bytes(&sine_48k(480));
+        let sine = f32_bytes(&sine_48k(480));
+        let zeros = f32_bytes(&constant(0.0, 480));
+        // Without a reset the next sound would start with the sine's delayed end.
         let mut conv = converter(48_000);
-        let produced = conv.packet(480, PLAIN, &raw, &counter).unwrap().len();
-        assert!(produced > 0);
-        // A wake that was signaled or drained packets never flushes.
-        assert!(conv.after_wake(true, 0).unwrap().is_empty());
-        assert!(conv.after_wake(false, 480).unwrap().is_empty());
-        assert!(conv.after_wake(true, 480).unwrap().is_empty());
-        // An idle timeout pushes the delayed end of the sine out...
-        let tail = conv.after_wake(false, 0).unwrap();
-        assert!(tail.iter().any(|f| f[0] != 0), "tail {tail:?}");
-        // ...so all of the 480 input frames (441 at 44.1 kHz) have come out.
-        assert!(produced + tail.len() >= 441, "{produced} + {}", tail.len());
-        // Only once: further idle timeouts have nothing left to flush.
-        assert!(conv.after_wake(false, 0).unwrap().is_empty());
+        conv.packet(480, PLAIN, &sine, &counter).unwrap();
+        let next = conv.packet(480, PLAIN, &zeros, &counter).unwrap();
+        assert!(next.iter().any(|f| f[0] != 0), "the filter held a tail");
+
+        let mut conv = converter(48_000);
+        assert!(!conv.packet(480, PLAIN, &sine, &counter).unwrap().is_empty());
+        // A wake that was signaled or drained packets keeps the filter as it is.
+        assert!(!conv.after_wake(true, 0));
+        assert!(!conv.after_wake(false, 480));
+        assert!(!conv.after_wake(true, 480));
+        assert!(conv.resampler.has_tail());
+        // An idle timeout resets it, once.
+        assert!(conv.after_wake(false, 0));
+        assert!(!conv.resampler.has_tail());
+        assert!(!conv.after_wake(false, 0));
+        // The next sound starts clean.
+        let next = conv.packet(480, PLAIN, &zeros, &counter).unwrap();
+        assert!(!next.is_empty());
+        assert!(next.iter().all(|f| *f == [0, 0]), "stale tail {next:?}");
         // New audio arms it again.
-        conv.packet(480, PLAIN, &raw, &counter).unwrap();
-        assert!(!conv.after_wake(false, 0).unwrap().is_empty());
+        assert!(conv.after_wake(false, 0));
         // Without resampling nothing is held back.
         let mut conv = converter(44_100);
-        conv.packet(480, PLAIN, &raw, &counter).unwrap();
-        assert!(conv.after_wake(false, 0).unwrap().is_empty());
+        conv.packet(480, PLAIN, &sine, &counter).unwrap();
+        assert!(!conv.after_wake(false, 0));
     }
 
     #[test]
@@ -1189,7 +1239,7 @@ mod tests {
         assert!(consumer.pop_exact(&mut chunk[..30]));
         assert!(chunk[..30].iter().all(|f| *f == [0, 0]));
 
-        // Resampling and the idle flush do not allocate either.
+        // Resampling and the idle reset do not allocate either.
         let (mut producer, _consumer) = ring::ring(4_096).unwrap();
         let script = vec![Poll::Packet(sine_48k(480), PLAIN), Poll::Empty, Poll::Empty];
         let mut drain = drain_loop(48_000, script, producer.shared());
@@ -1202,7 +1252,13 @@ mod tests {
             "resampling allocated"
         );
         let polls = &drain.source.written_at_poll;
-        assert!(producer.shared().written() > polls[2], "{polls:?}");
+        assert!(polls[1] > 0, "{polls:?}");
+        assert_eq!(
+            producer.shared().written(),
+            polls[2],
+            "the idle wake publishes nothing"
+        );
+        assert!(!drain.converter.resampler.has_tail());
     }
 
     /// A packet that is announced but reads empty ends the drain instead of spinning;
@@ -1225,17 +1281,17 @@ mod tests {
         assert_eq!(producer.shared().written(), 30);
     }
 
-    /// The loop end to end: a signaled wake drains the packet without flushing, the
-    /// first idle timeout flushes the resampler tail, the next one does nothing, and
-    /// a WASAPI error ends capture as `DeviceLost` with its HRESULT.
+    /// The loop end to end: a signaled wake drains the packet, the idle timeouts
+    /// publish nothing more (the first one resets the resampler), and a WASAPI error
+    /// ends capture as `DeviceLost` with its HRESULT.
     #[test]
-    fn run_flushes_once_when_idle_and_ends_with_device_lost() {
+    fn run_resets_the_resampler_when_idle_and_ends_with_device_lost() {
         let (mut producer, _consumer) = ring::ring(4_096).unwrap();
         let script = vec![
             Poll::Packet(sine_48k(480), PLAIN), // wake 1 (signaled)
             Poll::Empty,                        // wake 1: queue drained
-            Poll::Empty,                        // wake 2 (timeout): flush
-            Poll::Empty,                        // wake 3 (timeout): nothing to flush
+            Poll::Empty,                        // wake 2 (timeout): reset
+            Poll::Empty,                        // wake 3 (timeout): nothing to reset
         ]; // wake 4: AUDCLNT_E_DEVICE_INVALIDATED
         let mut drain = drain_loop(48_000, script, producer.shared());
         let shared = Shared::new().unwrap();
@@ -1252,22 +1308,19 @@ mod tests {
         );
         let polls = &drain.source.written_at_poll;
         assert_eq!(polls.len(), 5, "{polls:?}");
-        let (packet, flushed) = (polls[1], polls[3]);
+        let packet = polls[1];
         assert_eq!(polls[0], 0);
         assert!(packet > 0, "{polls:?}");
         assert_eq!(
-            polls[2], packet,
-            "a signaled wake does not flush: {polls:?}"
+            polls[2..],
+            [packet; 3],
+            "nothing is published after the packet: {polls:?}"
         );
+        assert_eq!(producer.shared().written(), packet);
         assert!(
-            flushed > packet,
-            "the first idle timeout flushes: {polls:?}"
+            !drain.converter.resampler.has_tail(),
+            "the idle timeout reset it"
         );
-        assert_eq!(
-            polls[4], flushed,
-            "the second has nothing to flush: {polls:?}"
-        );
-        assert_eq!(producer.shared().written(), flushed);
         assert_eq!(shared.discontinuities.load(Ordering::Relaxed), 0);
     }
 

@@ -21,7 +21,10 @@
 //! Structure: [`PtpTracker`] is the socket-less state machine (it takes the receive
 //! time as an argument, so the fixture can drive it); [`PtpService`] owns the sockets
 //! and the thread that feeds it; [`PtpClock`] is the lock-free view the tracker
-//! publishes after every message, read by the anchor thread.
+//! publishes after every message, read by the anchor thread. That thread holds
+//! anchors back while the clock is not locked and ends the stream when it stays
+//! unlocked too long (`control::PTP_LOST_AFTER_NS`), e.g. because PTP traffic stopped
+//! or this follower's thread died, so the supervisor reconnects and follows afresh.
 
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -118,6 +121,17 @@ impl PtpClock {
     pub fn locked_at(&self, now_ns: u64) -> bool {
         self.offset_ns().is_some()
             && now_ns.saturating_sub(self.last_sample_ns.load(Ordering::Acquire)) < STALE_AFTER_NS
+    }
+    /// How long the clock has not been locked at `rt::mono_ns()` value `now_ns`: 0
+    /// while [`locked_at`](Self::locked_at), otherwise the time since it went stale
+    /// (its last sample plus [`STALE_AFTER_NS`]). `None` when it has had no sample
+    /// since the last `follow`.
+    pub fn unlocked_for_ns(&self, now_ns: u64) -> Option<u64> {
+        let last = self.last_sample_ns.load(Ordering::Acquire);
+        if last == 0 || self.offset_ns().is_none() {
+            return None;
+        }
+        Some(now_ns.saturating_sub(last.saturating_add(STALE_AFTER_NS)))
     }
     /// Current offset estimate (master − local) in ns.
     pub fn offset_ns(&self) -> Option<f64> {
@@ -823,6 +837,28 @@ mod tests {
         assert_eq!(tracker.clock().offset_ns(), None);
         assert!(!tracker.clock().locked_at(2_000));
         assert_eq!(tracker.counters().syncs, 1, "counters are cumulative");
+    }
+
+    #[test]
+    fn unlocked_time_counts_from_when_the_clock_went_stale() {
+        let ip = Ipv4Addr::new(10, 0, 0, 1);
+        let mut tracker = PtpTracker::new();
+        let clock = tracker.clock().clone();
+        assert_eq!(clock.unlocked_for_ns(5_000_000_000), None, "never sampled");
+        tracker.follow(ip, None, 0);
+        let t2 = 1_000_000_000;
+        assert!(tracker.on_datagram(&sync(1, 9, false, 10_000_000_000), ip, t2));
+        assert_eq!(clock.unlocked_for_ns(t2), Some(0));
+        assert_eq!(clock.unlocked_for_ns(t2 + STALE_AFTER_NS - 1), Some(0));
+        assert!(clock.locked_at(t2 + STALE_AFTER_NS - 1));
+        assert!(!clock.locked_at(t2 + STALE_AFTER_NS));
+        assert_eq!(
+            clock.unlocked_for_ns(t2 + STALE_AFTER_NS + 10_000_000_000),
+            Some(10_000_000_000)
+        );
+        // follow() starts over: no sample yet.
+        tracker.follow(ip, None, 20_000_000_000);
+        assert_eq!(clock.unlocked_for_ns(30_000_000_000), None);
     }
 
     #[test]

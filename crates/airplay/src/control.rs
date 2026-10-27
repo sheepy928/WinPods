@@ -11,6 +11,12 @@
 //! audio), retransmit replies as requests arrive; tolerates WSAECONNRESET.
 //! Fixture: `anchors.json`.
 //!
+//! With PTP, anchors are held back while the followed clock is not locked (no sample
+//! for 3 s), with one warning per outage. If it stays unlocked for more than
+//! [`PTP_LOST_AFTER_NS`], the stream's end reason becomes [`PTP_LOST_REASON`] so the
+//! supervisor reconnects (a new session follows the receiver's clock afresh). Python
+//! kept sending anchors from the frozen offset and never noticed.
+//!
 //! Port of `LiveControl` in `legacy/python/winpods/raop_live.py`. The anchor head is
 //! the smoothed timeline at the moment the anchor is built, rounded half to even.
 
@@ -21,6 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use tracing::{info, warn};
 use windows::Win32::Networking::WinSock::{
     FD_READ, SOCKET, WSAEVENT, WSAEventSelect, WSAGetLastError,
 };
@@ -28,7 +35,7 @@ use winpods_rt::{AutoEvent, HANDLE, HiResTimer, mono_ns, wait_any};
 
 use crate::backlog::{Backlog, MAX_STORED_PACKET};
 use crate::ntp::NtpClock;
-use crate::ptp::PtpClock;
+use crate::ptp::{PtpClock, STALE_AFTER_NS};
 use crate::runtime::Shared;
 use crate::timeline::{Timeline, round_head};
 
@@ -40,6 +47,11 @@ pub const SYNC_D4_BYTES: usize = 20;
 pub const MAX_REPLY_BYTES: usize = 4 + MAX_STORED_PACKET;
 /// Interval between anchors.
 pub const ANCHOR_INTERVAL_NS: u64 = 1_000_000_000;
+/// How long the followed PTP clock may stay unlocked while a stream runs before the
+/// stream ends with [`PTP_LOST_REASON`].
+pub const PTP_LOST_AFTER_NS: u64 = 10_000_000_000;
+/// End reason of a stream whose PTP clock stayed unlocked for [`PTP_LOST_AFTER_NS`].
+pub const PTP_LOST_REASON: &str = "lost the receiver's clock (PTP)";
 
 fn marker(first: bool) -> u8 {
     if first { 0x90 } else { 0x80 }
@@ -198,6 +210,13 @@ pub(crate) struct ControlLoop {
     first_ts: u64,
     first: bool,
     scratch: Box<[u8; MAX_REPLY_BYTES]>,
+    /// `rt::mono_ns()` at creation: a PTP clock without any sample counts as
+    /// unlocked since then.
+    started_ns: u64,
+    /// True while a PTP outage is in progress and has been logged.
+    clock_warned: bool,
+    /// True once the stream was ended for a lost PTP clock.
+    clock_lost: bool,
 }
 
 impl ControlLoop {
@@ -216,7 +235,43 @@ impl ControlLoop {
             first_ts,
             first: true,
             scratch: Box::new([0u8; MAX_REPLY_BYTES]),
+            started_ns: mono_ns(),
+            clock_warned: false,
+            clock_lost: false,
         }
+    }
+
+    /// Whether an anchor may be built at `t_ns`: always with NTP; with PTP only while
+    /// the followed clock is locked, because a stale offset no longer tracks the
+    /// receiver. Logs once per outage, and ends the stream (through `shared`) once
+    /// the clock has been unlocked for longer than [`PTP_LOST_AFTER_NS`].
+    fn clock_ready(&mut self, t_ns: u64, shared: &Shared) -> bool {
+        let AnchorClock::Ptp(ptp) = &self.clock else {
+            return true;
+        };
+        if ptp.locked_at(t_ns) {
+            if self.clock_warned {
+                self.clock_warned = false;
+                info!("PTP: the receiver's clock is locked again; anchors resume");
+            }
+            return true;
+        }
+        let unlocked_ns = ptp
+            .unlocked_for_ns(t_ns)
+            .unwrap_or_else(|| t_ns.saturating_sub(self.started_ns));
+        if !self.clock_warned {
+            self.clock_warned = true;
+            warn!(
+                "PTP: the receiver's clock is not locked (no sync in the last {} s); \
+                 holding anchors until it is",
+                STALE_AFTER_NS / 1_000_000_000
+            );
+        }
+        if unlocked_ns > PTP_LOST_AFTER_NS && !self.clock_lost {
+            self.clock_lost = true;
+            shared.fail(PTP_LOST_REASON.into());
+        }
+        false
     }
 
     /// The anchor for `t_ns` given the current timeline, or `None` while the PTP
@@ -248,7 +303,14 @@ impl ControlLoop {
 
     /// Build and send the anchor for "now". Returns true when one was sent.
     pub(crate) fn send_anchor(&mut self, shared: &Shared) -> bool {
-        let t_ns = mono_ns();
+        self.send_anchor_at(mono_ns(), shared)
+    }
+
+    /// [`send_anchor`](Self::send_anchor) for `rt::mono_ns()` value `t_ns`.
+    fn send_anchor_at(&mut self, t_ns: u64, shared: &Shared) -> bool {
+        if !self.clock_ready(t_ns, shared) {
+            return false;
+        }
         let timeline = shared.timeline.load();
         let Some((packet, len)) = self.build_anchor(t_ns, &timeline) else {
             return false;
@@ -477,5 +539,102 @@ mod tests {
         // offset = T1 − t2 = 100 s − 1 s; master = 2 s + 99 s + 1 ms path allowance.
         let expected = anchor_d7(true, 4410 + 44100, 4410, 101_001_000_000, 0x1122);
         assert_eq!(packet, expected);
+    }
+
+    const SEC: u64 = 1_000_000_000;
+
+    /// A control loop sending to a local socket, its PTP tracker, and stream state.
+    fn ptp_control(started_ns: u64) -> (ControlLoop, crate::ptp::PtpTracker, Shared, UdpSocket) {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dest = receiver.local_addr().unwrap();
+        let evented = EventedSocket::new(UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap();
+        let mut tracker = crate::ptp::PtpTracker::new();
+        tracker.follow(std::net::Ipv4Addr::LOCALHOST, Some(0x1122), 0);
+        let clock = AnchorClock::Ptp(tracker.clock().clone());
+        let mut control = ControlLoop::new(evented, dest, clock, 4410, 4410);
+        control.started_ns = started_ns;
+        let shared = Shared::new(AutoEvent::new().unwrap(), AutoEvent::new().unwrap());
+        (control, tracker, shared, receiver)
+    }
+
+    fn ptp_sample(tracker: &mut crate::ptp::PtpTracker, t2: u64) {
+        let mut sync = vec![0u8; 44];
+        sync[1] = 2;
+        sync[20..28].copy_from_slice(&0x1122u64.to_be_bytes());
+        sync[34..40].copy_from_slice(&[0, 0, 0, 0, 0, 100]);
+        assert!(tracker.on_datagram(&sync, std::net::Ipv4Addr::LOCALHOST, t2));
+    }
+
+    #[test]
+    fn stale_ptp_clock_holds_anchors_then_ends_the_stream() {
+        let (mut control, mut tracker, shared, _receiver) = ptp_control(SEC);
+        let anchors = || shared.stats.anchors.load(Ordering::Relaxed);
+
+        ptp_sample(&mut tracker, 2 * SEC);
+        assert!(control.send_anchor_at(3 * SEC, &shared));
+        assert_eq!(anchors(), 1);
+
+        // No sample for 3 s: the frozen offset is not used for anchors any more.
+        let stale = 2 * SEC + STALE_AFTER_NS;
+        assert!(!control.send_anchor_at(stale, &shared));
+        assert!(control.clock_warned);
+        assert!(!control.send_anchor_at(stale + 5 * SEC, &shared));
+        assert_eq!(anchors(), 1);
+        assert_eq!(shared.end_reason(), None, "a short outage is ridden out");
+
+        // Still unlocked 10 s after going stale: not yet...
+        assert!(!control.send_anchor_at(stale + PTP_LOST_AFTER_NS, &shared));
+        assert_eq!(shared.end_reason(), None);
+        // ...but past that, the stream ends so the supervisor reconnects.
+        assert!(!control.send_anchor_at(stale + PTP_LOST_AFTER_NS + 1, &shared));
+        assert_eq!(shared.end_reason().as_deref(), Some(PTP_LOST_REASON));
+
+        // Samples again: anchors resume (the end reason stays until the restart).
+        let later = stale + PTP_LOST_AFTER_NS + 2 * SEC;
+        ptp_sample(&mut tracker, later);
+        assert!(control.send_anchor_at(later + SEC, &shared));
+        assert!(!control.clock_warned);
+        assert_eq!(anchors(), 2);
+        assert_eq!(shared.end_reason().as_deref(), Some(PTP_LOST_REASON));
+    }
+
+    #[test]
+    fn short_ptp_outages_are_ridden_out() {
+        let (mut control, mut tracker, shared, _receiver) = ptp_control(0);
+        // Outages of 9 s each, with a sample in between: never 10 s unlocked in a row.
+        let mut t = SEC;
+        for _ in 0..3 {
+            ptp_sample(&mut tracker, t);
+            assert!(control.send_anchor_at(t + SEC, &shared));
+            t += STALE_AFTER_NS + 9 * SEC;
+            assert!(!control.send_anchor_at(t, &shared));
+            assert!(control.clock_warned);
+        }
+        assert_eq!(shared.end_reason(), None);
+        assert_eq!(shared.stats.anchors.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn ptp_clock_that_never_locks_ends_the_stream() {
+        let start = 5 * SEC;
+        let (mut control, _tracker, shared, _receiver) = ptp_control(start);
+        assert!(!control.send_anchor_at(start, &shared));
+        assert!(!control.send_anchor_at(start + PTP_LOST_AFTER_NS, &shared));
+        assert_eq!(shared.end_reason(), None);
+        assert!(!control.send_anchor_at(start + PTP_LOST_AFTER_NS + SEC, &shared));
+        assert_eq!(shared.end_reason().as_deref(), Some(PTP_LOST_REASON));
+        assert_eq!(shared.stats.anchors.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn ntp_anchors_do_not_depend_on_ptp() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dest = receiver.local_addr().unwrap();
+        let evented = EventedSocket::new(UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap();
+        let clock = AnchorClock::Ntp(Arc::new(NtpClock::new()));
+        let mut control = ControlLoop::new(evented, dest, clock, 4410, 4410);
+        let shared = Shared::new(AutoEvent::new().unwrap(), AutoEvent::new().unwrap());
+        assert!(control.send_anchor_at(control.started_ns + 60 * SEC, &shared));
+        assert_eq!(shared.end_reason(), None);
     }
 }

@@ -16,19 +16,22 @@
 //! * `winpods-sender` (MMCSS "Pro Audio"): ring → packets ([`crate::sender`]).
 //!
 //! Panics and fatal errors in either thread are caught and reported through
-//! [`StreamHandle::end_reason`]; the supervisor then stops the stream.
+//! [`StreamHandle::end_reason`], as is a followed PTP clock that stays unlocked for
+//! longer than [`crate::control::PTP_LOST_AFTER_NS`]; the supervisor then stops the
+//! stream and reconnects.
 
 use std::any::Any;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Once};
 use std::thread::JoinHandle;
 
 use parking_lot::Mutex;
 use socket2::{Domain, Protocol, Socket, Type};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+use winpods_rt::power::ThrottleOptOut;
 use winpods_rt::{
     AutoEvent, HiResTimer, MmcssGuard, RingConsumer, ThreadPriority, ThrottleGuard, mono_ns,
     set_current_thread_priority,
@@ -141,12 +144,28 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
+    pub(crate) fn new(sender_wake: AutoEvent, control_wake: AutoEvent) -> Self {
+        Self {
+            stop: AtomicBool::new(false),
+            stats: Counters::default(),
+            timeline: SharedTimeline::new(),
+            backlog: Backlog::new(),
+            sender_wake,
+            control_wake,
+            end_reason: Mutex::new(None),
+        }
+    }
+
     /// Record why the stream cannot continue (the first reason wins).
     pub(crate) fn fail(&self, reason: String) {
         let mut slot = self.end_reason.lock();
         if slot.is_none() {
             *slot = Some(reason);
         }
+    }
+
+    pub(crate) fn end_reason(&self) -> Option<String> {
+        self.end_reason.lock().clone()
     }
 }
 
@@ -165,9 +184,10 @@ impl StreamHandle {
     pub fn stats(&self) -> StreamStats {
         self.shared.stats.snapshot()
     }
-    /// Set when a thread failed or panicked (the supervisor then reconnects).
+    /// Set when a thread failed or panicked, or the followed PTP clock was lost (the
+    /// supervisor then reconnects).
     pub fn end_reason(&self) -> Option<String> {
-        self.shared.end_reason.lock().clone()
+        self.shared.end_reason()
     }
     /// Stop both threads and return the ring consumer.
     pub fn stop(mut self) -> RingConsumer {
@@ -233,15 +253,7 @@ pub fn start(
         timer,
     } = resources;
 
-    let shared = Arc::new(Shared {
-        stop: AtomicBool::new(false),
-        stats: Counters::default(),
-        timeline: SharedTimeline::new(),
-        backlog: Backlog::new(),
-        sender_wake,
-        control_wake,
-        end_reason: Mutex::new(None),
-    });
+    let shared = Arc::new(Shared::new(sender_wake, control_wake));
     let clock = match (options.ptp, options.ntp) {
         (Some(ptp), _) => AnchorClock::Ptp(ptp),
         (None, Some(ntp)) => AnchorClock::Ntp(ntp),
@@ -260,6 +272,7 @@ pub fn start(
         drop_every: options.drop_every.unwrap_or(0),
     };
     let throttle = ThrottleGuard::streaming();
+    log_throttle_opt_out(&throttle);
 
     // Audio captured while connecting is stale; starting with it would add its
     // duration to the latency for the whole session.
@@ -359,6 +372,52 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
     }
 }
 
+/// Log once per process what Windows accepted of the power-throttling opt-out.
+fn log_throttle_opt_out(guard: &ThrottleGuard) {
+    static LOGGED: Once = Once::new();
+    // `None` only while another thread is still applying it; a later stream logs.
+    let Some(opt_out) = guard.opt_out() else {
+        return;
+    };
+    LOGGED.call_once(|| match opt_out {
+        ThrottleOptOut::Full => {
+            debug!("power throttling: EcoQoS off and timer resolution honoured while streaming");
+        }
+        ThrottleOptOut::ExecutionSpeedOnly { hresult } => info!(
+            "power throttling: EcoQoS off while streaming; this Windows has no \
+             timer-resolution policy ({hresult:#010x})"
+        ),
+        ThrottleOptOut::Failed { hresult } => warn!(
+            "Windows refused the power-throttling opt-out ({hresult:#010x}); audio may \
+             stutter while WinPods runs in the background"
+        ),
+    });
+}
+
+/// Join the MMCSS "Pro Audio" task for the calling thread. A refusal is logged here,
+/// before the thread's loop starts: as a warning the first time, then at debug level.
+fn join_mmcss(thread: &str) -> Option<MmcssGuard> {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let guard = MmcssGuard::pro_audio();
+    if guard.is_none() {
+        // AvSetMmThreadCharacteristicsW leaves the reason in the thread's last error.
+        let error = io::Error::last_os_error();
+        let detail = match error.raw_os_error() {
+            Some(0) | None => String::new(),
+            Some(_) => format!(" ({error})"),
+        };
+        if WARNED.swap(true, Ordering::Relaxed) {
+            debug!("{thread} thread: MMCSS \"Pro Audio\" registration failed{detail}");
+        } else {
+            warn!(
+                "{thread} thread: MMCSS \"Pro Audio\" registration failed{detail}; it runs at \
+                 normal priority"
+            );
+        }
+    }
+    guard
+}
+
 fn control_thread(mut control: ControlLoop, shared: &Shared) {
     set_current_thread_priority(ThreadPriority::AboveNormal);
     match catch_unwind(AssertUnwindSafe(|| {
@@ -380,7 +439,7 @@ fn sender_thread(
     shared: &Shared,
     timer: &HiResTimer,
 ) {
-    let _mmcss = MmcssGuard::pro_audio();
+    let _mmcss = join_mmcss("sender");
     // Held for the whole stream; nobody else locks the slot until the thread exits
     // (and parking_lot does not poison it if the loop panics).
     let mut guard = slot.lock();

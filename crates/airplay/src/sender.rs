@@ -6,8 +6,11 @@
 //! hires_timer(4 ms)])` }. Silence only when the ring has had no writes for
 //! `max(slack, 40 ms)` AND the timeline has run `slack` ahead, where
 //! `slack = clamp(latency − render − 5, 5, 250)` ms; silence fills up to the
-//! timeline (max 16 packets per wake); after a stall, trim ring content above
-//! packet + 30 ms, up to the silence debt. MMCSS "Pro Audio"; no allocation,
+//! timeline (max 16 packets per wake); the partial packet a sound ends with (fewer
+//! than 352 frames left in the ring once capture is quiet) goes out first, padded
+//! with zeros in its own slot, so it is neither lost nor prepended to the next
+//! sound; after a stall, trim ring content above packet + 30 ms, up to the silence
+//! debt (which includes that padding). MMCSS "Pro Audio"; no allocation,
 //! logging or contended locks in the loop. Optional diagnostic `drop_every`:
 //! skip the socket send of every Nth packet (still stored in the backlog).
 //!
@@ -222,19 +225,33 @@ impl Sender {
             // Not enough audio for a packet: has Windows stopped playing?
             let now = mono_ns();
             let target = self.timeline.head_at(now);
-            if !in_stall {
-                let last_write = ring.last_write_ns();
-                let quiet = if last_write == 0 {
-                    u64::MAX
-                } else {
-                    now.saturating_sub(last_write)
-                };
-                if quiet >= policy.stall_ns && target - self.rtptime as f64 >= policy.slack_frames {
-                    in_stall = true;
-                    stats.stalls.fetch_add(1, Ordering::Relaxed);
-                }
+            let last_write = ring.last_write_ns();
+            let quiet = if last_write == 0 {
+                u64::MAX
+            } else {
+                now.saturating_sub(last_write)
+            };
+            let capture_quiet = quiet >= policy.stall_ns;
+            if !in_stall && capture_quiet && target - self.rtptime as f64 >= policy.slack_frames {
+                in_stall = true;
+                stats.stalls.fetch_add(1, Ordering::Relaxed);
             }
             if in_stall {
+                // The sound ended part-way through a packet (or a short write came in
+                // during the stall): send the rest now, zero-padded in its own slot,
+                // instead of holding it back until the next sound. The zeros count as
+                // inserted silence. A write after the quiet check (`last_write` moved)
+                // cancels this: those frames may be the start of a new sound.
+                let remainder = consumer.available();
+                if capture_quiet
+                    && (1..FRAMES_PER_PACKET).contains(&remainder)
+                    && ring.last_write_ns() == last_write
+                    && consumer.pop_exact(&mut frames[..remainder])
+                {
+                    frames[remainder..].fill([0, 0]);
+                    self.send(&frames, shared)?;
+                    debt = (debt + FRAMES_PER_PACKET - remainder).min(MAX_DEBT_FRAMES);
+                }
                 let mut burst = 0;
                 while (self.rtptime + FRAMES_PER_PACKET as u64) as f64 <= target
                     && burst < MAX_SILENCE_BURST

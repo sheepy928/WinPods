@@ -14,8 +14,14 @@
 //! gives the exact output size. Output buffers are sized once from
 //! `output_frames_max()`. No captured audio ever waits for a chunk to fill; the only
 //! hold-back is the filter's own delay ([`StereoResampler::output_delay`], about
-//! 1.3 ms at 48 kHz), which [`StereoResampler::flush`] pushes out with zero padding
-//! (`Indexing::partial_len(0)`) when capture goes quiet.
+//! 1.3 ms at 48 kHz), which [`StereoResampler::flush`] can push out with zero padding
+//! (`Indexing::partial_len(0)`). Capture does not flush: when it goes quiet it
+//! [`reset`](StereoResampler::reset)s the filter instead, so the next sound never
+//! starts with the end of the previous one. It notices after 200 ms, which at
+//! latencies up to about 275 ms is at or after the sender's stall, where a flushed
+//! tail would land after the silence already sent. At longer latencies the sender
+//! stalls a little later (at most 250 ms) and the ~1.3 ms tail is simply lost; that
+//! is accepted (see `capture::WAIT_TIMEOUT`).
 
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{
@@ -183,7 +189,14 @@ impl StereoResampler {
         Ok(written)
     }
 
+    /// True when input was processed since the last flush or reset, so the filter
+    /// still holds its delayed tail. Always false in bypass.
+    pub fn has_tail(&self) -> bool {
+        self.engine.as_ref().is_some_and(|engine| engine.dirty)
+    }
+
     /// Forget all history (e.g. after a discontinuity the caller wants to start clean).
+    /// Never allocates.
     pub fn reset(&mut self) {
         if let Some(engine) = self.engine.as_mut() {
             engine.resampler.reset();
@@ -384,6 +397,35 @@ mod tests {
         assert_eq!(rs.flush(&mut out).unwrap(), 0);
         rs.reset();
         assert_eq!(rs.flush(&mut out).unwrap(), 0);
+    }
+
+    #[test]
+    fn reset_drops_the_tail_so_the_next_input_starts_clean() {
+        let mut rs = StereoResampler::new(48_000, 480).unwrap();
+        let mut out = vec![[0i16; 2]; rs.max_output_frames(480)];
+        let loud = sine(48_000, 1_000.0, 0.5, 480);
+        let quiet = vec![[0.0f32; 2]; 480];
+        assert!(!rs.has_tail());
+        rs.process(&loud, &mut out).unwrap();
+        assert!(rs.has_tail());
+        // Without a reset, the next input comes out after the previous one's tail.
+        let produced = rs.process(&quiet, &mut out).unwrap();
+        assert!(out[..produced].iter().any(|f| f[0] != 0));
+
+        rs.process(&loud, &mut out).unwrap();
+        rs.reset();
+        assert!(!rs.has_tail());
+        let produced = rs.process(&quiet, &mut out).unwrap();
+        assert!(produced > 0);
+        assert!(out[..produced].iter().all(|f| *f == [0, 0]), "stale tail");
+
+        // A flush also empties it; bypass never holds anything.
+        rs.flush(&mut out).unwrap();
+        assert!(!rs.has_tail());
+        let mut bypass = StereoResampler::new(44_100, 480).unwrap();
+        let mut out = vec![[0i16; 2]; bypass.max_output_frames(480)];
+        bypass.process(&loud, &mut out).unwrap();
+        assert!(!bypass.has_tail());
     }
 
     #[test]

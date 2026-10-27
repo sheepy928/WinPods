@@ -306,6 +306,19 @@ impl Feeder {
         }
     }
 
+    /// Push `count` packets of 352 frames, one at a time at the stream rate (the
+    /// first one immediately).
+    fn push_packets_paced(&mut self, count: usize) {
+        let t0 = mono_ns();
+        for k in 0..count as u64 {
+            let due = t0 + k * FRAMES_PER_PACKET as u64 * 1_000_000_000 / 44_100;
+            while mono_ns() < due {
+                thread::sleep(Duration::from_micros(500));
+            }
+            self.push(FRAMES_PER_PACKET);
+        }
+    }
+
     fn last_write_ns(&self) -> u64 {
         self.producer.shared().last_write_ns()
     }
@@ -453,6 +466,17 @@ fn stalled_capture_inserts_silence_up_to_the_timeline() {
         .expect("silence was inserted");
     assert!(packets[first_silence..].iter().all(AudioPacket::is_silence));
     assert!(packets[..first_silence].iter().all(|p| !p.is_silence()));
+    // The feed ended mid-packet; that remainder went out zero-padded just before.
+    let rest = (feeder.next % FRAMES_PER_PACKET as u64) as usize;
+    if rest > 0 {
+        let padded = &packets[first_silence - 1];
+        assert_signal(
+            &padded.frames[..rest],
+            feeder.next - rest as u64,
+            "remainder",
+        );
+        assert!(padded.frames[rest..].iter().all(|f| *f == [0, 0]));
+    }
 
     let delay = packets[first_silence].arrival - last_write;
     println!(
@@ -485,6 +509,123 @@ fn stalled_capture_inserts_silence_up_to_the_timeline() {
         (head - nominal).abs() < 1500.0,
         "head {head} vs nominal {nominal}"
     );
+}
+
+/// `frames` are the signal from frame `start` on.
+fn assert_signal(frames: &[Frame], start: u64, context: &str) {
+    for (j, frame) in frames.iter().enumerate() {
+        assert_eq!(*frame, signal(start + j as u64), "{context}: frame {j}");
+    }
+}
+
+#[test]
+fn audio_ending_mid_packet_is_sent_zero_padded_when_capture_stops() {
+    let _serial = serial();
+    let rx = MockReceiver::new();
+    let params = rx.params(Codec::Alac, 100);
+    let (mut feeder, consumer) = new_ring();
+    let (handle, _) = start_stream(&params, consumer, ptp_options());
+
+    // The sound ends 300 frames into its 41st packet, then Windows goes quiet.
+    const FULL: usize = 40;
+    const REST: usize = 300;
+    feeder.push_packets_paced(FULL);
+    feeder.push(REST);
+    let last_write = feeder.last_write_ns();
+    thread::sleep(Duration::from_millis(300));
+    let (stats, _) = stop(handle);
+
+    let packets = rx.audio(Codec::Alac);
+    // Seq, RTP time and nonce counter run on without a gap.
+    assert_continuous(&packets, &params);
+    assert!(packets.len() > FULL + 20, "{} packets", packets.len());
+    for (k, packet) in packets[..FULL].iter().enumerate() {
+        let start = (k * FRAMES_PER_PACKET) as u64;
+        assert_signal(&packet.frames, start, &format!("packet {k}"));
+    }
+    // The first packet after the stall, in the next RTP slot: the last 300 frames of
+    // the sound, then zeros.
+    let tail = &packets[FULL];
+    let waited = tail.arrival - last_write;
+    assert!(
+        (40 * MS..100 * MS).contains(&waited),
+        "remainder sent {waited} ns after the last write"
+    );
+    for (j, frame) in tail.frames.iter().enumerate() {
+        let expected = if j < REST {
+            signal((FULL * FRAMES_PER_PACKET + j) as u64)
+        } else {
+            [0, 0]
+        };
+        assert_eq!(*frame, expected, "remainder packet frame {j}");
+    }
+    // Nothing but silence afterwards: no audio is left behind in the ring.
+    assert!(packets[FULL + 1..].iter().all(AudioPacket::is_silence));
+    assert_eq!(stats.ring_frames, 0, "{stats:?}");
+    assert_eq!(stats.stalls, 1, "{stats:?}");
+    assert_eq!(stats.frames_trimmed, 0, "{stats:?}");
+    // The padded packet carries audio, so it is not counted as a silence packet.
+    let silent = (packets.len() - FULL - 1) as u64;
+    assert!(
+        (stats.silence_packets..=stats.silence_packets + 2).contains(&silent),
+        "{silent} silent packets received, {} counted",
+        stats.silence_packets
+    );
+}
+
+/// A write shorter than a packet during a stall (what the capture's late resampler
+/// flush used to produce) neither ends the stall nor waits for the next sound: it is
+/// sent zero-padded in its own slot once capture is quiet again.
+#[test]
+fn short_write_during_a_stall_is_not_prepended_to_the_next_sound() {
+    let _serial = serial();
+    let rx = MockReceiver::new();
+    let params = rx.params(Codec::Alac, 100);
+    let (mut feeder, consumer) = new_ring();
+    let (handle, _) = start_stream(&params, consumer, ptp_options());
+
+    feeder.push_packets_paced(20);
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(handle.stats().stalls, 1);
+    const SHORT: usize = 119;
+    let short_start = feeder.next;
+    feeder.push(SHORT);
+    let short_write = feeder.last_write_ns();
+    thread::sleep(Duration::from_millis(150));
+    let next_sound = feeder.next;
+    feeder.push_packets_paced(20);
+    let (stats, _) = stop(handle);
+
+    let packets = rx.audio(Codec::Alac);
+    assert_continuous(&packets, &params);
+    assert_eq!(stats.stalls, 1, "{stats:?}");
+    let short = packets
+        .iter()
+        .position(|p| p.frames[0] == signal(short_start))
+        .expect("the short write was sent");
+    let packet = &packets[short];
+    assert!(
+        packet.arrival - short_write >= 40 * MS,
+        "sent before capture was quiet"
+    );
+    assert_signal(&packet.frames[..SHORT], short_start, "short write");
+    assert!(packet.frames[SHORT..].iter().all(|f| *f == [0, 0]));
+    assert!(packets[20..short].iter().all(AudioPacket::is_silence));
+    // The next sound starts on a packet boundary of its own.
+    let resumed = packets
+        .iter()
+        .position(|p| p.frames[0] == signal(next_sound))
+        .expect("the next sound was sent");
+    assert!(
+        packets[short + 1..resumed]
+            .iter()
+            .all(AudioPacket::is_silence)
+    );
+    for (k, packet) in packets[resumed..].iter().enumerate() {
+        let start = next_sound + (k * FRAMES_PER_PACKET) as u64;
+        assert_signal(&packet.frames, start, &format!("next sound packet {k}"));
+    }
+    assert_eq!(packets.len() - resumed, 20);
 }
 
 #[test]
