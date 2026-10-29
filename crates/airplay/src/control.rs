@@ -18,7 +18,10 @@
 //! kept sending anchors from the frozen offset and never noticed.
 //!
 //! Port of `LiveControl` in `legacy/python/winpods/raop_live.py`. The anchor head is
-//! the smoothed timeline at the moment the anchor is built, rounded half to even.
+//! the stream's [`Timeline`] at the anchor's own master time, rounded half to even, so
+//! every anchor lies on one line of exactly 44 100 frames per master second whatever
+//! noise the PTP offset estimate has (Python used a timeline smoothed toward the audio
+//! sent, which carried the capture clock's drift into the anchors).
 
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -200,6 +203,19 @@ pub(crate) enum AnchorClock {
     Ntp(Arc<NtpClock>),
 }
 
+impl AnchorClock {
+    /// The timing master's time (ns) at `rt::mono_ns()` value `t_ns`, the clock the
+    /// stream's [`Timeline`] runs on: the followed PTP master's time, or `t_ns` itself
+    /// with NTP (the receiver follows our NTP clock, which runs on `mono_ns`). `None`
+    /// while the PTP master has no offset estimate.
+    pub(crate) fn master_ns(&self, t_ns: u64) -> Option<u64> {
+        match self {
+            Self::Ptp(ptp) => ptp.to_master_ns(t_ns),
+            Self::Ntp(_) => Some(t_ns),
+        }
+    }
+}
+
 /// State of the control thread: the socket plus everything needed for anchors and
 /// retransmit replies.
 pub(crate) struct ControlLoop {
@@ -207,7 +223,7 @@ pub(crate) struct ControlLoop {
     dest: SocketAddr,
     clock: AnchorClock,
     latency: u32,
-    first_ts: u64,
+    timeline: Timeline,
     first: bool,
     scratch: Box<[u8; MAX_REPLY_BYTES]>,
     /// `rt::mono_ns()` at creation: a PTP clock without any sample counts as
@@ -225,14 +241,14 @@ impl ControlLoop {
         dest: SocketAddr,
         clock: AnchorClock,
         latency: u32,
-        first_ts: u64,
+        timeline: Timeline,
     ) -> Self {
         Self {
             socket,
             dest,
             clock,
             latency,
-            first_ts,
+            timeline,
             first: true,
             scratch: Box::new([0u8; MAX_REPLY_BYTES]),
             started_ns: mono_ns(),
@@ -274,17 +290,14 @@ impl ControlLoop {
         false
     }
 
-    /// The anchor for `t_ns` given the current timeline, or `None` while the PTP
-    /// master is unknown (the next attempt follows a second later).
-    fn build_anchor(&self, t_ns: u64, timeline: &Timeline) -> Option<([u8; 28], usize)> {
-        let head = if timeline.is_started() {
-            round_head(timeline.head_at(t_ns))
-        } else {
-            self.first_ts
-        };
+    /// The anchor for `rt::mono_ns()` value `t_ns`, or `None` while the PTP master is
+    /// unknown (the next attempt follows a second later). The head is the timeline at
+    /// the very master time the anchor carries.
+    fn build_anchor(&self, t_ns: u64) -> Option<([u8; 28], usize)> {
+        let master_ns = self.clock.master_ns(t_ns)?;
+        let head = round_head(self.timeline.head_at(master_ns));
         match &self.clock {
             AnchorClock::Ptp(ptp) => {
-                let master_ns = ptp.to_master_ns(t_ns)?;
                 let clock_id = ptp.master_clock_id();
                 if clock_id == 0 {
                     return None;
@@ -311,8 +324,7 @@ impl ControlLoop {
         if !self.clock_ready(t_ns, shared) {
             return false;
         }
-        let timeline = shared.timeline.load();
-        let Some((packet, len)) = self.build_anchor(t_ns, &timeline) else {
+        let Some((packet, len)) = self.build_anchor(t_ns) else {
             return false;
         };
         match self.socket.socket().send_to(&packet[..len], self.dest) {
@@ -409,18 +421,8 @@ mod tests {
             let t_ns = case["t_ns"].as_u64().unwrap();
             let head = case["head"].as_u64().unwrap();
             if let Some(bits) = case["head_at_bits"].as_str() {
-                // Rebuild head_at exactly like the generator: start at (t, head) and
-                // set err to the fractional part, then round half to even.
+                // The generator's fractional timeline head, rounded half to even.
                 let head_at = f64::from_bits(u64::from_str_radix(bits, 16).unwrap());
-                let mut timeline = Timeline::new();
-                let base = head_at.round();
-                timeline.start(t_ns, base as u64);
-                timeline.set_err(head_at - base);
-                assert_eq!(
-                    timeline.head_at(t_ns).to_bits(),
-                    head_at.to_bits(),
-                    "case {i}"
-                );
                 assert_eq!(round_head(head_at), head, "case {i}");
             }
             let offset = case["ptp_offset_ns"].as_f64().unwrap();
@@ -521,24 +523,50 @@ mod tests {
         let evented = EventedSocket::new(socket).unwrap();
         let mut tracker = crate::ptp::PtpTracker::new();
         let ptp = tracker.clock().clone();
-        let control = ControlLoop::new(evented, dest, AnchorClock::Ptp(ptp), 4410, 4410);
-        let mut timeline = Timeline::new();
-        timeline.start(1_000_000_000, 4410);
+        // The stream started at master time 100.001 s (local 1 s) with RTP 4410.
+        let timeline = Timeline::new(100_001_000_000, 4410);
+        let control = ControlLoop::new(evented, dest, AnchorClock::Ptp(ptp), 4410, timeline);
         // No master yet: nothing to send.
-        assert!(control.build_anchor(1_000_000_000, &timeline).is_none());
+        assert!(control.build_anchor(1_000_000_000).is_none());
 
         let ip = std::net::Ipv4Addr::LOCALHOST;
         tracker.follow(ip, Some(0x1122), 0);
-        let mut sync = vec![0u8; 44];
-        sync[1] = 2;
-        sync[20..28].copy_from_slice(&0x1122u64.to_be_bytes());
-        sync[34..40].copy_from_slice(&[0, 0, 0, 0, 0, 100]);
-        assert!(tracker.on_datagram(&sync, ip, 1_000_000_000));
-        let (packet, len) = control.build_anchor(2_000_000_000, &timeline).unwrap();
+        ptp_sample_at(&mut tracker, 1_000_000_000, 100);
+        let (packet, len) = control.build_anchor(2_000_000_000).unwrap();
         assert_eq!(len, ANCHOR_D7_BYTES);
         // offset = T1 − t2 = 100 s − 1 s; master = 2 s + 99 s + 1 ms path allowance.
         let expected = anchor_d7(true, 4410 + 44100, 4410, 101_001_000_000, 0x1122);
         assert_eq!(packet, expected);
+    }
+
+    #[test]
+    fn anchors_stay_on_one_line_when_the_offset_estimate_jumps() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dest = socket.local_addr().unwrap();
+        let mut tracker = crate::ptp::PtpTracker::new();
+        tracker.follow(std::net::Ipv4Addr::LOCALHOST, Some(0x1122), 0);
+        ptp_sample_at(&mut tracker, SEC, 100);
+        let m0 = tracker.clock().to_master_ns(SEC).unwrap();
+        let timeline = Timeline::new(m0, 4410);
+        let clock = AnchorClock::Ptp(tracker.clock().clone());
+        let evented = EventedSocket::new(socket).unwrap();
+        let control = ControlLoop::new(evented, dest, clock, 4410, timeline);
+        // One sample arrives with 8 ms less delay than the others, so the estimate
+        // steps by +8 ms: the anchors move along the line, never off it.
+        for i in 0..4u64 {
+            let t2 = (2 + i) * SEC;
+            let early = if i == 1 { 8_000_000 } else { 0 };
+            ptp_sample_raw(&mut tracker, t2, (101 + i) * SEC + early);
+            let (packet, _) = control.build_anchor(t2).unwrap();
+            let played = u32::from_be_bytes(packet[4..8].try_into().unwrap());
+            let master = u64::from_be_bytes(packet[8..16].try_into().unwrap());
+            let expected = round_head(timeline.head_at(master)) - 4410;
+            assert_eq!(u64::from(played), expected, "anchor {i} at {master}");
+        }
+        assert!(
+            tracker.clock().offset_ns().unwrap() > 99.007e9,
+            "the step happened"
+        );
     }
 
     const SEC: u64 = 1_000_000_000;
@@ -551,18 +579,30 @@ mod tests {
         let mut tracker = crate::ptp::PtpTracker::new();
         tracker.follow(std::net::Ipv4Addr::LOCALHOST, Some(0x1122), 0);
         let clock = AnchorClock::Ptp(tracker.clock().clone());
-        let mut control = ControlLoop::new(evented, dest, clock, 4410, 4410);
+        let timeline = Timeline::new(100 * SEC, 4410);
+        let mut control = ControlLoop::new(evented, dest, clock, 4410, timeline);
         control.started_ns = started_ns;
         let shared = Shared::new(AutoEvent::new().unwrap(), AutoEvent::new().unwrap());
         (control, tracker, shared, receiver)
     }
 
-    fn ptp_sample(tracker: &mut crate::ptp::PtpTracker, t2: u64) {
+    /// Feed a one-step Sync received at local `t2` whose origin is `origin_ns`.
+    fn ptp_sample_raw(tracker: &mut crate::ptp::PtpTracker, t2: u64, origin_ns: u64) {
         let mut sync = vec![0u8; 44];
         sync[1] = 2;
         sync[20..28].copy_from_slice(&0x1122u64.to_be_bytes());
-        sync[34..40].copy_from_slice(&[0, 0, 0, 0, 0, 100]);
+        sync[34..40].copy_from_slice(&(origin_ns / SEC).to_be_bytes()[2..]);
+        sync[40..44].copy_from_slice(&((origin_ns % SEC) as u32).to_be_bytes());
         assert!(tracker.on_datagram(&sync, std::net::Ipv4Addr::LOCALHOST, t2));
+    }
+
+    /// Feed a Sync received at local `t2` whose origin is `origin_s` whole seconds.
+    fn ptp_sample_at(tracker: &mut crate::ptp::PtpTracker, t2: u64, origin_s: u64) {
+        ptp_sample_raw(tracker, t2, origin_s * SEC);
+    }
+
+    fn ptp_sample(tracker: &mut crate::ptp::PtpTracker, t2: u64) {
+        ptp_sample_at(tracker, t2, 100);
     }
 
     #[test]
@@ -632,7 +672,8 @@ mod tests {
         let dest = receiver.local_addr().unwrap();
         let evented = EventedSocket::new(UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap();
         let clock = AnchorClock::Ntp(Arc::new(NtpClock::new()));
-        let mut control = ControlLoop::new(evented, dest, clock, 4410, 4410);
+        let timeline = Timeline::new(mono_ns(), 4410);
+        let mut control = ControlLoop::new(evented, dest, clock, 4410, timeline);
         let shared = Shared::new(AutoEvent::new().unwrap(), AutoEvent::new().unwrap());
         assert!(control.send_anchor_at(control.started_ns + 60 * SEC, &shared));
         assert_eq!(shared.end_reason(), None);

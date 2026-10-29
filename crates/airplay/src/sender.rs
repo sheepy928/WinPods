@@ -10,9 +10,15 @@
 //! than 352 frames left in the ring once capture is quiet) goes out first, padded
 //! with zeros in its own slot, so it is neither lost nor prepended to the next
 //! sound; after a stall, trim ring content above packet + 30 ms, up to the silence
-//! debt (which includes that padding). MMCSS "Pro Audio"; no allocation,
-//! logging or contended locks in the loop. Optional diagnostic `drop_every`:
-//! skip the socket send of every Nth packet (still stored in the backlog).
+//! debt (which includes that padding). After every packet of captured audio the
+//! [servo](crate::servo) compares the sent head with the timeline and sets the
+//! capture's rate ratio in the ring, so the audio keeps pace with the receiver's clock
+//! (it holds while silence is sent). MMCSS "Pro Audio"; no allocation, logging or
+//! contended locks in the loop. Optional diagnostic `drop_every`: skip the socket
+//! send of every Nth packet (still stored in the backlog).
+//!
+//! The timeline is the stream's fixed master-clock mapping ([`crate::timeline`]), read
+//! at the master's current time (the followed PTP clock, or `mono_ns` with NTP).
 //!
 //! Why the thresholds: Windows loopback capture delivers in bursts with gaps of up
 //! to ~22 ms. Those gaps are ridden out by the receiver's buffer (latency minus its
@@ -25,11 +31,13 @@ use std::net::UdpSocket;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use winpods_rt::{Frame, HiResTimer, RingConsumer, mono_ns, wait_any};
+use winpods_rt::{Frame, HiResTimer, RingConsumer, RingShared, mono_ns, wait_any};
 
 use crate::alac::{encode_alac_packet, encode_pcm_packet};
+use crate::control::AnchorClock;
 use crate::packet::{AudioCipher, MAX_PACKET_BYTES, rtp_header};
 use crate::runtime::Shared;
+use crate::servo::RateServo;
 use crate::timeline::Timeline;
 use crate::types::{
     ALAC_FRAME_BYTES, Codec, DEFAULT_RENDER_MS, FRAMES_PER_PACKET, PCM_FRAME_BYTES, SAMPLE_RATE,
@@ -103,7 +111,10 @@ pub(crate) struct Sender {
     /// Unwrapped RTP time of the next packet (= head of everything sent so far).
     rtptime: u64,
     first: bool,
+    /// The stream's timeline (starts at the first timestamp) and the clock it runs on.
     timeline: Timeline,
+    clock: AnchorClock,
+    servo: RateServo,
     policy: StallPolicy,
     drop_every: u64,
     built: u64,
@@ -111,8 +122,14 @@ pub(crate) struct Sender {
 }
 
 impl Sender {
-    /// `timeline` must already be started (at the stream's first timestamp).
-    pub(crate) fn new(socket: UdpSocket, config: &SenderConfig, timeline: Timeline) -> Self {
+    /// `timeline` must start at the stream's first timestamp; `clock` gives the
+    /// master time it runs on.
+    pub(crate) fn new(
+        socket: UdpSocket,
+        config: &SenderConfig,
+        timeline: Timeline,
+        clock: AnchorClock,
+    ) -> Self {
         Self {
             socket,
             cipher: AudioCipher::new(&config.shk),
@@ -122,11 +139,36 @@ impl Sender {
             rtptime: config.first_ts,
             first: true,
             timeline,
+            clock,
+            servo: RateServo::new(1.0),
             policy: config.policy,
             drop_every: u64::from(config.drop_every),
             built: 0,
             send_errors: 0,
         }
+    }
+
+    /// The timeline's head at `rt::mono_ns()` value `t_ns` (`None` while the PTP
+    /// master has no offset estimate).
+    fn target(&self, t_ns: u64) -> Option<f64> {
+        self.clock
+            .master_ns(t_ns)
+            .map(|master| self.timeline.head_at(master))
+    }
+
+    /// After a packet of captured audio: steer the capture rate by how far the sent
+    /// head is ahead of the timeline (see [`crate::servo`]).
+    fn steer(&mut self, ring: &RingShared, shared: &Shared) {
+        let now = mono_ns();
+        let Some(target) = self.target(now) else {
+            return;
+        };
+        let ratio = self.servo.update(now, self.rtptime as f64 - target);
+        ring.set_rate_ratio(ratio);
+        shared
+            .stats
+            .rate_adjust_ppb
+            .store(((ratio - 1.0) * 1e9).round() as i64, Ordering::Relaxed);
     }
 
     /// Encode, seal, send (unless withheld), store and account for one packet.
@@ -167,8 +209,6 @@ impl Sender {
         self.seq = self.seq.wrapping_add(1);
         self.rtptime += FRAMES_PER_PACKET as u64;
         stats.packets.fetch_add(1, Ordering::Relaxed);
-        self.timeline.observe(mono_ns(), self.rtptime);
-        shared.timeline.publish(&self.timeline);
         Ok(())
     }
 
@@ -192,6 +232,8 @@ impl Sender {
         let mut in_stall = false;
         let mut debt = 0usize; // frames of silence inserted during the current stall
         let stats = &shared.stats;
+        // Start from what the previous stream on this ring learned about the clocks.
+        self.servo = RateServo::new(ring.rate_ratio());
 
         loop {
             if shared.stop.load(Ordering::Acquire) {
@@ -214,6 +256,7 @@ impl Sender {
                     debt = 0;
                 }
                 self.send(&frames, shared)?;
+                self.steer(&ring, shared);
                 if shared.stop.load(Ordering::Relaxed) {
                     return Ok(());
                 }
@@ -222,9 +265,11 @@ impl Sender {
                 .ring_frames
                 .store(consumer.available() as u64, Ordering::Relaxed);
 
-            // Not enough audio for a packet: has Windows stopped playing?
+            // Not enough audio for a packet: has Windows stopped playing? (Without a
+            // master time there is no timeline to fill; the control thread ends the
+            // stream if that lasts.)
             let now = mono_ns();
-            let target = self.timeline.head_at(now);
+            let target = self.target(now).unwrap_or(f64::NEG_INFINITY);
             let last_write = ring.last_write_ns();
             let quiet = if last_write == 0 {
                 u64::MAX
@@ -235,6 +280,7 @@ impl Sender {
             if !in_stall && capture_quiet && target - self.rtptime as f64 >= policy.slack_frames {
                 in_stall = true;
                 stats.stalls.fetch_add(1, Ordering::Relaxed);
+                self.servo.hold();
             }
             if in_stall {
                 // The sound ended part-way through a packet (or a short write came in

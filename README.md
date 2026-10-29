@@ -171,16 +171,22 @@ WASAPI loopback ─► resample to 44.1 kHz ─► ring ─► sender thread ─
 | `apps/winpods` | the Slint window and tray (`WinPods.exe`) |
 | `apps/winpods-cli` | diagnostics CLI |
 
-* **Latency is set by timing anchors.** Once a second WinPods tells the HomePod "the
-  frame sent right now must be played *latency* from now", written in the HomePod's own
-  PTP timescale (WinPods follows its clock; it never acts as a clock source).
+* **Latency is set by timing anchors.** Once a second WinPods tells the HomePod which
+  frame to play when, written in the HomePod's own PTP timescale (WinPods follows its
+  clock; it never acts as a clock source). All anchors lie on one timeline, fixed when
+  the stream starts: exactly 44 100 frames per second of HomePod time, *latency* behind
+  the audio being sent.
 * **Audio** goes as uncompressed ALAC (no encoder delay), one 352-frame packet the moment
   Windows has produced it. Sender and capture threads run with MMCSS "Pro Audio"
   priority and wake on events, not timers.
-* **Bursty loopback audio** (Windows delivers it in 10–25 ms bursts) is smoothed by a
-  model of the send timeline, so bursts never make the speaker resynchronise; silence is
-  only inserted when Windows stops playing, and audio that piles up after a hiccup is
-  trimmed so the delay never grows.
+* **Clock drift is cancelled.** A sound card or virtual cable runs on its own clock, a
+  few ppm off the HomePod's (VB-Audio Cable: 22 ppm fast, which used to add about 80 ms
+  of delay per hour of streaming). WinPods measures how far the audio it sends runs
+  ahead of the timeline and nudges the resampler by that much (at most 0.1 %, far too
+  little to hear), so the delay stays where you set it however long a stream runs.
+* **Bursty loopback audio** (Windows delivers it in 10–25 ms bursts) never makes the
+  speaker resynchronise: silence is only inserted when Windows stops playing, and audio
+  that piles up after a hiccup is trimmed so the delay never grows.
 
 The protocol code was ported from the Python v0.1 implementation and
 [pyatv](https://github.com/postlund/pyatv); `tools/gen_fixtures.py` generates test

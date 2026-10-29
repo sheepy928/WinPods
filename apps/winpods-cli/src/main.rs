@@ -457,6 +457,7 @@ fn stats_line(snap: &Snapshot, peak: f32, drop_test: bool) -> String {
     if snap.send_errors > 0 {
         line.push_str(&format!(" send_errors={}", snap.send_errors));
     }
+    line.push_str(&format!(" rate={:+.1}ppm", snap.rate_adjust_ppm));
     line
 }
 

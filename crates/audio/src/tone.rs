@@ -96,8 +96,9 @@ fn frames_due(elapsed_ns: u64) -> u64 {
     (u128::from(elapsed_ns) * u128::from(RATE) / 1_000_000_000) as u64
 }
 
-/// Feed the ring in [`CHUNK_FRAMES`] chunks at real-time pace until `stop` is
-/// signaled. Allocation-free; returns how the loop ended.
+/// Feed the ring in [`CHUNK_FRAMES`] chunks at real-time pace, adjusted by the ring's
+/// rate ratio like captured audio, until `stop` is signaled. Allocation-free; returns
+/// how the loop ended.
 pub(crate) fn pace(
     producer: &mut RingProducer,
     generator: &mut ToneGenerator,
@@ -108,8 +109,15 @@ pub(crate) fn pace(
     let handles = [stop, timer.handle()];
     let start = mono_ns();
     let mut written: u64 = 0;
+    // Frames the rate adjustment has added (or, negative, removed) so far.
+    let mut adjusted = 0.0f64;
+    let mut last = start;
     loop {
-        let due = frames_due(mono_ns().saturating_sub(start));
+        let now = mono_ns();
+        let ratio = producer.shared().rate_ratio();
+        adjusted += (ratio - 1.0) * now.saturating_sub(last) as f64 * f64::from(RATE) / 1e9;
+        last = now;
+        let due = frames_due(now.saturating_sub(start)).saturating_add_signed(adjusted as i64);
         while written + CHUNK_FRAMES as u64 <= due {
             generator.fill(&mut chunk);
             producer.set_peak(peak(&chunk));

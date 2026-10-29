@@ -1402,44 +1402,6 @@ def anchor_raw(control, transport, dest, context, t_ns: int, latency: int):
     return first, (sent[0][0] if sent else None)
 
 
-# ========================================================================== timeline
-def gen_timeline() -> Dict[str, Any]:
-    rate = raop_live.SAMPLE_RATE
-    t0, r0 = 1_000_000_000, 4410
-    timeline = raop_live.Timeline(rate)
-    timeline.start(t0, r0)
-    pattern = [0, 0, 0, 12_000_000, 4_000_000, 0, 0, 0, 12_000_000, 0, 0]  # 20 ms gaps
-
-    def send_time(k: int) -> int:
-        # Packet k paced by a source clock running +2000 ppm fast, delivered in bursts.
-        ideal = t0 + (k + 1) * FRAMES_PER_PACKET * 10**15 // (rate * 1_002_000)
-        jitter = (k * 7919 + 13) % 400_000
-        return ideal + pattern[k % len(pattern)] + jitter
-
-    steps: List[Dict[str, Any]] = []
-    last_t = t0
-    big_k = (2**32 - r0) // FRAMES_PER_PACKET - 40
-    ks = list(range(0, 240)) + list(range(big_k, big_k + 80))
-    for n, k in enumerate(ks):
-        t = max(send_time(k), last_t + 50_000)
-        last_t = t
-        head = r0 + (k + 1) * FRAMES_PER_PACKET
-        timeline.observe(t, head)
-        steps.append({"op": "observe", "t": t, "head": head, "err": timeline.err,
-                      "err_bits": fbits(timeline.err)})
-        if n % 3 == 2:
-            q = t + 2_500_000
-            value = timeline.head_at(q)
-            steps.append({"op": "head_at", "t": q, "value": value, "value_bits": fbits(value)})
-        if k == 239:  # a query in the middle of the 27 h jump
-            q = send_time(big_k) - 3_600_000_000_000
-            value = timeline.head_at(q)
-            steps.append({"op": "head_at", "t": q, "value": value, "value_bits": fbits(value)})
-    check(any(s.get("head", 0) > 2**32 for s in steps), "no head above 2^32")
-    return {"_meta": meta(), "rate": rate, "alpha": raop_live.TIMELINE_ALPHA, "t0": t0, "r0": r0,
-            "steps": steps}
-
-
 # =============================================================================== PTP
 C1 = RECEIVER_CLOCK_ID
 C2 = 0x02DDEEFFFE001122
@@ -1973,7 +1935,6 @@ def main() -> int:
         fixtures["audio_packets.json"] = audio
         fixtures["alac.json"] = gen_alac()
         fixtures["anchors.json"] = gen_anchors(backlog)
-        fixtures["timeline.json"] = gen_timeline()
         fixtures["ptp.json"] = gen_ptp()
         mdns_data: Dict[str, Any] = {
             "_meta": meta(receiver_ip=RECEIVER_IP, port=MDNS_PORT, wait_s=MDNS_WAIT),

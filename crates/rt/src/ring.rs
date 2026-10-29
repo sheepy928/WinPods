@@ -3,7 +3,9 @@
 //! Frames are native-endian stereo `i16` at 44.1 kHz. The producer commits frames
 //! and then signals an auto-reset event, so the sender can sleep on the event and
 //! wake the moment audio is available. Shared atomics carry the timing facts the
-//! sender's stall logic needs (`last_write_ns`) and the counters the UI shows.
+//! sender's stall logic needs (`last_write_ns`), the counters the UI shows, and, in
+//! the other direction, the rate adjustment the sender asks the producer to apply
+//! (`rate_ratio`) so the audio keeps pace with the receiver's clock.
 //!
 //! Overflow policy: when the ring is full new frames are dropped and counted. This
 //! only happens while no session is consuming (the ring holds 3 s); the sender
@@ -24,6 +26,10 @@ pub const SAMPLE_RATE: u32 = 44_100;
 /// Default capacity: 3 seconds.
 pub const DEFAULT_CAPACITY: usize = SAMPLE_RATE as usize * 3;
 
+/// Largest rate adjustment [`RingShared::set_rate_ratio`] accepts: ±0.1 % (1000 ppm),
+/// ten times the drift of any real sound card clock, and still inaudible as pitch.
+pub const MAX_RATE_ADJUST: f64 = 0.001;
+
 /// State shared by both ends (and readable by the engine for statistics).
 pub struct RingShared {
     last_write_ns: AtomicU64,
@@ -31,6 +37,8 @@ pub struct RingShared {
     dropped: AtomicU64,
     peak_bits: AtomicU32,
     last_chunk: AtomicU32,
+    /// f64 bits of the rate ratio (1.0 = nominal).
+    rate_ratio_bits: AtomicU64,
     event: AutoEvent,
     capacity: usize,
 }
@@ -55,6 +63,22 @@ impl RingShared {
     /// Size in frames of the most recent producer write.
     pub fn last_chunk(&self) -> u32 {
         self.last_chunk.load(Ordering::Relaxed)
+    }
+    /// Frames the producer should write per nominal frame (1.0 = as captured): below
+    /// 1.0 it produces fewer, above more. Set by the sender to keep the audio on the
+    /// receiver's clock; capture applies it in its resampler.
+    pub fn rate_ratio(&self) -> f64 {
+        f64::from_bits(self.rate_ratio_bits.load(Ordering::Relaxed))
+    }
+    /// Ask the producer for `ratio` (clamped to 1 ± [`MAX_RATE_ADJUST`]; NaN = 1.0).
+    pub fn set_rate_ratio(&self, ratio: f64) {
+        let ratio = if ratio.is_nan() {
+            1.0
+        } else {
+            ratio.clamp(1.0 - MAX_RATE_ADJUST, 1.0 + MAX_RATE_ADJUST)
+        };
+        self.rate_ratio_bits
+            .store(ratio.to_bits(), Ordering::Relaxed);
     }
     /// Event signaled after every producer write.
     pub fn event_handle(&self) -> crate::HANDLE {
@@ -86,6 +110,7 @@ pub fn ring(capacity_frames: usize) -> std::io::Result<(RingProducer, RingConsum
         dropped: AtomicU64::new(0),
         peak_bits: AtomicU32::new(0f32.to_bits()),
         last_chunk: AtomicU32::new(0),
+        rate_ratio_bits: AtomicU64::new(1f64.to_bits()),
         event,
         capacity: capacity_frames,
     });
@@ -295,5 +320,19 @@ mod tests {
         assert_eq!(c.shared().peak(), 1.0);
         p.set_peak(0.25);
         assert_eq!(c.shared().peak(), 0.25);
+    }
+
+    #[test]
+    fn rate_ratio_starts_nominal_and_is_clamped() {
+        let (p, c) = ring(10).unwrap();
+        assert_eq!(p.shared().rate_ratio(), 1.0);
+        c.shared().set_rate_ratio(1.0 - 22e-6);
+        assert_eq!(p.shared().rate_ratio(), 1.0 - 22e-6);
+        c.shared().set_rate_ratio(1.5);
+        assert_eq!(p.shared().rate_ratio(), 1.0 + MAX_RATE_ADJUST);
+        c.shared().set_rate_ratio(0.0);
+        assert_eq!(p.shared().rate_ratio(), 1.0 - MAX_RATE_ADJUST);
+        c.shared().set_rate_ratio(f64::NAN);
+        assert_eq!(p.shared().rate_ratio(), 1.0);
     }
 }

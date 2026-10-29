@@ -178,6 +178,9 @@ pub struct Snapshot {
     pub send_errors: u64,
     pub withheld: u64,
     pub ring_ms: f32,
+    /// Rate adjustment asked of the capture to stay on the receiver's clock, ppm
+    /// (negative: the capture clock runs that much fast).
+    pub rate_adjust_ppm: f64,
     pub ring_dropped: u64,
     pub capture_discontinuities: u64,
     pub pairing_retries: u32,

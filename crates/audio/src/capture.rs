@@ -630,6 +630,9 @@ impl<S: PacketSource> DrainLoop<S> {
         let mut total = 0;
         while self.source.next_packet_frames()? > 0 {
             let (frames, flags) = self.source.read_packet(&mut self.raw)?;
+            // The sender's rate adjustment, which keeps the audio on the receiver's clock.
+            let rate = producer.shared().rate_ratio();
+            self.converter.resampler.set_rate(rate);
             let converted = self
                 .converter
                 .packet(frames, flags, &self.raw, discontinuities)?;

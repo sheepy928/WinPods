@@ -288,13 +288,18 @@ impl Feeder {
     /// Deliver audio at exactly 44.1 kHz on average for `duration`, in 220-frame
     /// chunks, sleeping `gaps_ms[i]` between deliveries (Windows loopback is bursty).
     fn feed(&mut self, duration: Duration, gaps_ms: &[u64]) {
+        self.feed_at_speed(duration, gaps_ms, 1.0);
+    }
+
+    /// [`feed`](Self::feed) from a capture clock running at `speed` × 44.1 kHz.
+    fn feed_at_speed(&mut self, duration: Duration, gaps_ms: &[u64], speed: f64) {
         let t0 = mono_ns();
         let base = self.next;
         let total = duration.as_nanos() as u64;
         let mut i = 0;
         loop {
             let elapsed = (mono_ns() - t0).min(total);
-            let due = (u128::from(elapsed) * 44_100 / 1_000_000_000) as u64;
+            let due = (elapsed as f64 * 44_100.0 * speed / 1e9) as u64;
             while self.next - base + CHUNK as u64 <= due {
                 self.push(CHUNK);
             }
@@ -813,10 +818,11 @@ fn ptp_anchors_have_the_expected_cadence_and_content() {
         // master = build time + offset + 1 ms; built at most a few ms before arrival.
         let local = master_ns - PTP_OFFSET_NS - MS;
         assert!(local <= *arrival && *arrival - local < 5 * MS, "anchor {i}");
-        // head = smoothed timeline at the build time.
+        // head = the stream's fixed timeline at the anchor's master time: exactly
+        // 44.1 frames per ms since the start, whatever the audio did.
         let nominal = params.first_ts as f64 + (local - stats.started_ns) as f64 * 44_100.0 / 1e9;
         assert!(
-            (f64::from(head) - nominal).abs() < 1500.0,
+            (f64::from(head) - nominal).abs() <= 1.0,
             "anchor {i}: head {head} vs nominal {nominal}"
         );
         if i == 0 {
@@ -828,6 +834,35 @@ fn ptp_anchors_have_the_expected_cadence_and_content() {
                 "anchor interval {interval} ns"
             );
         }
+    }
+}
+
+#[test]
+fn the_sender_steers_a_drifting_capture_toward_the_timeline() {
+    let _serial = serial();
+    let rx = MockReceiver::new();
+    let params = rx.params(Codec::Alac, 100);
+    // A capture clock 2 % fast, then one 2 % slow. The real capture applies the ratio
+    // the sender asks for; this feeder ignores it, so the error keeps growing and two
+    // seconds are plenty to see the sender ask for fewer frames, then for more.
+    for (speed, wants_fewer) in [(1.02, true), (0.98, false)] {
+        let (mut feeder, consumer) = new_ring();
+        let ring = consumer.shared().clone();
+        let (handle, _) = start_stream(&params, consumer, ptp_options());
+        feeder.feed_at_speed(Duration::from_millis(2000), &[5, 10], speed);
+        let (stats, _) = stop(handle);
+        let ratio = ring.rate_ratio();
+        if wants_fewer {
+            assert!(ratio < 1.0 - 1e-4, "{speed}: ratio {ratio}");
+        } else {
+            assert!(ratio > 1.0 + 1e-4, "{speed}: ratio {ratio}");
+        }
+        let reported = stats.rate_adjust_ppb as f64 / 1e9;
+        assert!(
+            (reported - (ratio - 1.0)).abs() < 5e-5,
+            "{speed}: stats say {reported}, ring {ratio}"
+        );
+        assert_eq!(stats.silence_packets, 0, "{speed}: capture never stalled");
     }
 }
 

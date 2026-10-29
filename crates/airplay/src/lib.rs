@@ -10,7 +10,7 @@
 //! * control plane — [`tlv8`], [`srp`], [`hap`], [`rtsp`], [`bodies`],
 //!   [`event_channel`], [`session`]
 //! * real-time path — [`alac`], [`packet`], [`timeline`], [`backlog`], [`ptp`],
-//!   [`control`], [`ntp`], [`sender`], [`runtime`]
+//!   [`control`], [`ntp`], [`sender`], [`servo`], [`runtime`]
 //! * discovery — [`mdns`]
 
 pub mod types;
@@ -33,6 +33,7 @@ pub mod packet;
 pub mod ptp;
 pub mod runtime;
 pub mod sender;
+pub mod servo;
 pub mod timeline;
 
 // discovery

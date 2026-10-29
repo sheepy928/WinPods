@@ -1,12 +1,14 @@
 //! Starts and stops the real-time part of a stream (workstream: real-time).
 //! CONTRACT: used by the engine; keep the public signatures.
 //!
-//! `start` (step 15 of the session sequence): clear the ring, start the timeline at
-//! `(rt::mono_ns(), params.first_ts)`, spawn the control thread (sends the first
-//! anchor immediately: 0xD7 with PTP, 0xD4 with NTP), then spawn the sender thread
-//! whose first packet uses `params.first_seq` / `params.first_ts`. While a stream
-//! runs, hold an `rt::ThrottleGuard`. `stop` joins both threads and hands the ring
-//! consumer back so the next session reuses it.
+//! `start` (step 15 of the session sequence): clear the ring, fix the timeline at
+//! `(master time now, params.first_ts)` ([`crate::timeline`]; the master is the
+//! followed PTP clock, or `rt::mono_ns()` with NTP), spawn the control thread (sends
+//! the first anchor immediately: 0xD7 with PTP, 0xD4 with NTP), then spawn the sender
+//! thread whose first packet uses `params.first_seq` / `params.first_ts`. While a
+//! stream runs, hold an `rt::ThrottleGuard`. `stop` joins both threads and hands the
+//! ring consumer back so the next session reuses it (with the rate ratio its sender
+//! learned, so the next stream starts on the receiver's clock).
 //!
 //! Threads:
 //!
@@ -24,7 +26,7 @@ use std::any::Any;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Once};
 use std::thread::JoinHandle;
 
@@ -42,7 +44,7 @@ use crate::control::{AnchorClock, ControlLoop, EventedSocket};
 use crate::ntp::NtpClock;
 use crate::ptp::PtpClock;
 use crate::sender::{Sender, SenderConfig, StallPolicy};
-use crate::timeline::{SharedTimeline, Timeline};
+use crate::timeline::Timeline;
 use crate::types::StreamParams;
 
 /// Send buffer of the audio data socket.
@@ -93,6 +95,9 @@ pub struct StreamStats {
     pub withheld: u64,
     /// Frames waiting in the ring (sampled by the sender each loop).
     pub ring_frames: u64,
+    /// Rate adjustment asked of the capture, parts per billion (−22 000 = 22 ppm
+    /// fewer frames: the capture clock runs that much faster than the receiver's).
+    pub rate_adjust_ppb: i64,
     /// `rt::mono_ns()` when the stream started.
     pub started_ns: u64,
 }
@@ -110,6 +115,7 @@ pub(crate) struct Counters {
     pub(crate) send_errors: AtomicU64,
     pub(crate) withheld: AtomicU64,
     pub(crate) ring_frames: AtomicU64,
+    pub(crate) rate_adjust_ppb: AtomicI64,
     pub(crate) started_ns: AtomicU64,
 }
 
@@ -127,6 +133,7 @@ impl Counters {
             send_errors: get(&self.send_errors),
             withheld: get(&self.withheld),
             ring_frames: get(&self.ring_frames),
+            rate_adjust_ppb: self.rate_adjust_ppb.load(Ordering::Relaxed),
             started_ns: get(&self.started_ns),
         }
     }
@@ -136,7 +143,6 @@ impl Counters {
 pub(crate) struct Shared {
     pub(crate) stop: AtomicBool,
     pub(crate) stats: Counters,
-    pub(crate) timeline: SharedTimeline,
     pub(crate) backlog: Backlog,
     pub(crate) sender_wake: AutoEvent,
     pub(crate) control_wake: AutoEvent,
@@ -148,7 +154,6 @@ impl Shared {
         Self {
             stop: AtomicBool::new(false),
             stats: Counters::default(),
-            timeline: SharedTimeline::new(),
             backlog: Backlog::new(),
             sender_wake,
             control_wake,
@@ -259,9 +264,6 @@ pub fn start(
         (None, Some(ntp)) => AnchorClock::Ntp(ntp),
         (None, None) => AnchorClock::Ntp(Arc::new(NtpClock::new())),
     };
-    let dest = SocketAddr::from((params.receiver, params.control_port));
-    let mut control_loop =
-        ControlLoop::new(control, dest, clock, params.latency_frames, params.first_ts);
     let config = SenderConfig {
         codec: params.codec,
         ssrc: params.ssrc,
@@ -279,10 +281,25 @@ pub fn start(
     let mut consumer = consumer;
     consumer.clear();
     let started_ns = mono_ns();
-    let mut timeline = Timeline::new();
-    timeline.start(started_ns, params.first_ts);
-    shared.timeline.publish(&timeline);
+    // The session only starts playback once the PTP clock is locked.
+    let Some(master_ns) = clock.master_ns(started_ns) else {
+        let error = io::Error::other("the receiver's clock (PTP) has no time estimate yet");
+        return Err((error, consumer));
+    };
+    let timeline = Timeline::new(master_ns, params.first_ts);
     shared.stats.started_ns.store(started_ns, Ordering::Relaxed);
+    shared.stats.rate_adjust_ppb.store(
+        ((consumer.shared().rate_ratio() - 1.0) * 1e9).round() as i64,
+        Ordering::Relaxed,
+    );
+    let dest = SocketAddr::from((params.receiver, params.control_port));
+    let mut control_loop = ControlLoop::new(
+        control,
+        dest,
+        clock.clone(),
+        params.latency_frames,
+        timeline,
+    );
 
     // First anchor before any audio (0x90 marker); retried by the thread if the
     // PTP master is not known yet.
@@ -297,7 +314,7 @@ pub fn start(
         Err(e) => return Err((e, consumer)),
     };
 
-    let sender = Sender::new(data, &config, timeline);
+    let sender = Sender::new(data, &config, timeline, clock);
     let slot: ConsumerSlot = Arc::new(Mutex::new(Some(consumer)));
     let sender_slot = slot.clone();
     let sender_shared = shared.clone();

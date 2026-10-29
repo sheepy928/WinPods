@@ -295,7 +295,7 @@ impl StatsLog {
 fn stats_summary(stats: &runtime::StreamStats, uptime: Duration) -> String {
     let secs = uptime.as_secs();
     format!(
-        "{}m {}s: {} packets, {} silence, {} pauses, {} frames trimmed, {}/{} resent, {} send errors, ring {:.0} ms",
+        "{}m {}s: {} packets, {} silence, {} pauses, {} frames trimmed, {}/{} resent, {} send errors, ring {:.0} ms, rate {:+.1} ppm",
         secs / 60,
         secs % 60,
         stats.packets,
@@ -306,6 +306,7 @@ fn stats_summary(stats: &runtime::StreamStats, uptime: Duration) -> String {
         stats.retransmit_requests,
         stats.send_errors,
         stats.ring_frames as f64 / 44.1,
+        stats.rate_adjust_ppb as f64 / 1000.0,
     )
 }
 
@@ -1157,6 +1158,7 @@ impl Engine {
             snap.send_errors = stats.send_errors;
             snap.withheld = stats.withheld;
             snap.ring_ms = stats.ring_frames as f32 / 44.1;
+            snap.rate_adjust_ppm = stats.rate_adjust_ppb as f64 / 1000.0;
             snap.pairing_retries = stream.session.pairing_retries();
             snap.feedback = stream.session.last_feedback();
             if let Some(ptp) = &stream.ptp {
@@ -1682,9 +1684,10 @@ mod tests {
         assert!(log.due(&stats, at(4)), "resends are logged");
 
         stats.ring_frames = 176;
+        stats.rate_adjust_ppb = -21_840;
         assert_eq!(
             stats_summary(&stats, Duration::from_secs(725)),
-            "12m 5s: 7500 packets, 9000 silence, 1 pauses, 0 frames trimmed, 2/2 resent, 0 send errors, ring 4 ms"
+            "12m 5s: 7500 packets, 9000 silence, 1 pauses, 0 frames trimmed, 2/2 resent, 0 send errors, ring 4 ms, rate -21.8 ppm"
         );
     }
 

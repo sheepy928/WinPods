@@ -175,14 +175,6 @@ and 1- and 3-frame inputs. `pcm_be` is the interleaved big-endian input.
 * `retransmit`: retransmit requests (`80 D5 seq lost_seqno count`, plus variants) and
   the replies `80 D6 <orig seq> <orig packet>` built from `backlog`.
 
-### timeline.json: `raop_live.Timeline`
-
-A deterministic, bursty schedule: packets roughly every 8 ms, 20 ms gaps followed by
-catch-up, and a source clock running +2000 ppm fast. `observe` steps record `err`;
-`head_at` steps record the value. Halfway through, the clock jumps about 27 h so `head`
-crosses 2^32. `nominal = r0 + (t - t0) * rate / 1e9`, where `(t - t0) * rate` is an exact
-integer (up to about 4.3e18) converted to f64 before the division.
-
 ### ptp.json: `PtpFollower` message handling
 
 The follower is socket-less, with `monotonic` patched to `t2 / 1e9`. Each case is a list
