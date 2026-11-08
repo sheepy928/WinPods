@@ -23,12 +23,21 @@ devices such as the AirPort Express are not supported).
 
 ## Install
 
-1. Download `WinPods-vX.Y.Z-windows-x64.zip` from the
+1. Download `WinPods-vX.Y.Z-setup.exe` from the
    [latest release](https://github.com/sheepy928/WinPods/releases/latest).
-2. Extract it to a folder you keep, for example `%LOCALAPPDATA%\Programs\WinPods`
-   (running it from inside the zip works, but then start-with-Windows and updates are off).
-3. Run `WinPods.exe`. The exe is not code-signed yet, so SmartScreen may warn the first
+2. Run it. It installs for your user only, into `%LOCALAPPDATA%\Programs\WinPods`, with no
+   administrator prompt, and adds WinPods to the Start menu (and, if you tick it, the
+   desktop). The installer is not code-signed yet, so SmartScreen may warn the first
    time: *More info* → *Run anyway*.
+3. To start WinPods when you sign in, turn on **Settings → Start with Windows**.
+
+WinPods keeps itself up to date from there. To remove it, use **Settings → Apps →
+WinPods → Uninstall**; it also removes the start-with-Windows entry and asks whether to
+delete your settings and log.
+
+Prefer no installer? Download `WinPods-vX.Y.Z-windows-x64.zip` instead and extract it to
+a folder you keep (running it from inside the zip works, but then start-with-Windows and
+updates are off).
 
 **Coming from v0.1 (the Python version)?** Quit it from its tray icon first: both
 versions use the same ports and speaker session, so only one can run. Your settings
@@ -105,7 +114,7 @@ Settings live in `%APPDATA%\WinPods\config.json`, the log in
 
 ## Command line
 
-`winpods-cli.exe` (in the same zip) is a diagnostics tool:
+`winpods-cli.exe` (installed next to `WinPods.exe`, and in the zip) is a diagnostics tool:
 
 ```text
 winpods-cli --scan                     find AirPlay speakers on the network
@@ -148,10 +157,11 @@ git tag v0.2.1
 git push origin v0.2.1
 ```
 
-CI checks that the tag matches the version, builds both exes, writes
-`SHA256SUMS.txt`, signs it with the release key (GitHub environment `release`, secrets
-`MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD`) and publishes the release with the zip,
-the raw exes, the checksums and the signature.
+CI checks that the tag matches the version, builds both exes and the installer
+(`installer/WinPods.iss`, Inno Setup 6), writes `SHA256SUMS.txt`, signs it with the
+release key (GitHub environment `release`, secrets `MINISIGN_SECRET_KEY` and
+`MINISIGN_PASSWORD`) and publishes the release with the installer, the zip, the raw exes,
+the checksums and the signature.
 
 ## How it works
 

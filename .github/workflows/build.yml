@@ -104,6 +104,17 @@ jobs:
           Copy-Item target\release\WinPods.exe, target\release\winpods-cli.exe, README.md, LICENSE, THIRD-PARTY-NOTICES.html pkg\WinPods\
           Compress-Archive -Path pkg\WinPods -DestinationPath "out\WinPods-$tag-windows-x64.zip"
           Copy-Item target\release\WinPods.exe, target\release\winpods-cli.exe out\
+          # The installer packs the same folder as the zip (Inno Setup 6, preinstalled on
+          # most runner images).
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw "could not install Inno Setup" }
+          }
+          $version = $tag.TrimStart('v')
+          $numeric = ($version -split '-')[0]
+          & $iscc /Qp "/DAppVersion=$version" "/DFileVersion=$numeric" "/DSourceDir=$PWD\pkg\WinPods" "/DOutputDir=$PWD\out" installer\WinPods.iss
+          if ($LASTEXITCODE -ne 0) { throw "installer build failed" }
           $lines = Get-ChildItem out -File | Sort-Object Name | ForEach-Object {
             "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
           }

@@ -23,7 +23,8 @@
 //!   else has the `.new` file open, then `exe → exe.old` and `exe.new → exe` back to
 //!   back (retrying sharing violations); on failure rename back and keep running.
 //!   The caller then hands off (`WinPods.exe --post-update <pid>`) and exits.
-//! * `finish_post_update`: delete leftover `.old`/`.new` files.
+//! * `finish_post_update`: delete leftover `.old`/`.new` files, and show the new
+//!   version in Settings > Apps when the installer registered this folder.
 //! * The release page is always `https://github.com/<repo>/releases/tag/<tag>`, built
 //!   here (never taken from the API JSON).
 //! * `WINPODS_UPDATE_REPO` overrides the repository (testing).
@@ -428,7 +429,8 @@ impl Updater {
         !paths::is_in_temp_dir(&exe) && exe.parent().is_some_and(win::dir_writable)
     }
 
-    /// Delete leftover `.old` / `.new` files from a previous update.
+    /// Delete leftover `.old` / `.new` files from a previous update, then show the new
+    /// version in Settings > Apps if the installer registered this folder.
     ///
     /// Right after a hand-off the previous process may still be exiting, so this waits
     /// up to ~5 s for its `.old` image to become deletable; call it off the UI thread.
@@ -445,6 +447,7 @@ impl Updater {
             targets.push(cli);
         }
         cleanup_leftovers(&targets, POST_UPDATE_WAIT);
+        crate::install::refresh_registration(dir, env!("CARGO_PKG_VERSION"));
     }
 
     /// (file to replace as `WinPods.exe`, its folder).

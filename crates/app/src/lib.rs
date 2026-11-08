@@ -3,6 +3,7 @@
 
 pub mod autostart;
 pub mod config;
+pub mod install;
 pub mod logging;
 pub mod paths;
 pub mod single_instance;
